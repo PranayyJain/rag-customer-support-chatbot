@@ -431,7 +431,7 @@ class RAGChatbot:
     def generate_response(self, query: str, context: List[Dict], intent: str, entities: Dict, conversation_context: List[Dict] = None) -> str:
         """Generate response using Groq LLM only if relevant content is found"""
         try:
-            # Handle greetings first (before e-commerce check)
+            # Handle greetings first
             if intent == 'greeting':
                 return """Hello! I'm your AI customer support assistant. I can help you with:
 
@@ -443,29 +443,20 @@ class RAGChatbot:
 
 How can I assist you today?"""
             
-            # EARLY EXIT: If we have order_id + product, create ticket and end conversation
-            # Check if we have enough info from conversation context to create a ticket
-            if conversation_context and len(conversation_context) > 0:
-                # Debug: Log the full conversation context
-                logger.info(f"Full conversation context: {conversation_context}")
-                
-                # Check if we have order_id and product info from any previous messages
+            # EARLY EXIT: Only for return requests with complete information
+            if intent == 'return' and conversation_context and len(conversation_context) > 0:
                 has_order_id = any('order_id' in msg.get('entities', {}) for msg in conversation_context)
                 has_product = any('product' in msg.get('entities', {}) for msg in conversation_context)
                 
-                logger.info(f"Early exit check - has_order_id: {has_order_id}, has_product: {has_product}")
-                logger.info(f"Conversation context entities: {[msg.get('entities', {}) for msg in conversation_context]}")
-                
-                # If we have both, create ticket and end conversation
                 if has_order_id and has_product:
-                    logger.info("Early exit triggered - creating ticket and ending conversation")
+                    logger.info("Early exit triggered - creating ticket for return request")
                     return """Perfect! I have all the information I need to process your return request.
 
 I've created a support ticket for you, and our team will contact you within 2 hours to arrange the return process. This ensures we handle your return request correctly and efficiently.
 
 Thank you for contacting us. Is there anything else I can help you with today?"""
             
-            # Check if query is e-commerce related (with conversation context)
+            # Check if query is e-commerce related
             if not self.is_ecommerce_related(query, conversation_context):
                 return """I apologize, but I'm specifically designed to help with e-commerce customer support inquiries only. 
 
@@ -473,41 +464,9 @@ Your question appears to be outside the scope of our customer support services. 
 
 For immediate assistance with non-e-commerce matters, please contact the appropriate department or service provider."""
             
-            # Check if we have relevant content from knowledge base
+            # Handle different intents appropriately when no knowledge base content is found
             if not context or len(context) == 0:
-                # Check if we're missing critical information from conversation context
-                missing_info = []
-                
-                # Check if we have order_id in any previous messages
-                has_order_id = any('order_id' in msg.get('entities', {}) for msg in conversation_context)
-                logger.info(f"Checking for order_id in conversation context: {has_order_id}")
-                if not has_order_id:
-                    missing_info.append("order ID")
-                
-                # Check if we have product in any previous messages  
-                has_product = any('product' in msg.get('entities', {}) for msg in conversation_context)
-                logger.info(f"Checking for product in conversation context: {has_product}")
-                if not has_product:
-                    missing_info.append("product name")
-                
-                if missing_info:
-                    return f"""To help you with your return request, I need a bit more information. Please provide your: {', '.join(missing_info)}.
-
-Once I have this information, I can assist you better with the return process."""
-                
-                return """I apologize, but I don't have specific information in my knowledge base to answer your question accurately. 
-
-This could be because:
-- Your question is about a topic not covered in our current documentation
-- The information might be outdated or not yet added to our knowledge base
-- Your query might need more specific details
-
-I recommend:
-1. Contacting our human support team for immediate assistance
-2. Checking our FAQ section on our website
-3. Providing more specific details about your issue
-
-Would you like me to create a support ticket so our team can help you directly?"""
+                return self._get_intent_specific_response(intent, query, conversation_context)
             
             # If we have relevant context, use the API to generate a response
             # Prepare context
@@ -571,6 +530,199 @@ Would you like me to create a support ticket so our team can help you directly?"
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+            
+            # If we have relevant context, use the API to generate a response
+            # Prepare context
+            context_text = "\n\n".join([chunk['content'] for chunk in context])
+            
+            # Create system prompt with conversation context
+            conversation_summary = ""
+            if conversation_context and len(conversation_context) > 0:
+                recent_messages = conversation_context[-3:]  # Last 3 messages
+                conversation_summary = "\n\nConversation History:\n"
+                for i, msg in enumerate(recent_messages):
+                    conversation_summary += f"User: {msg.get('query', '')}\n"
+                    if msg.get('entities'):
+                        conversation_summary += f"Extracted: {msg.get('entities')}\n"
+            
+            system_prompt = f"""You are an intelligent customer support assistant for an e-commerce platform. 
+            You have access to a comprehensive knowledge base and should provide helpful, accurate responses.
+            
+            User Intent: {intent}
+            Extracted Information: {entities}
+            
+            Guidelines:
+            - Be helpful, professional, and empathetic
+            - Use the provided context to answer questions accurately
+            - Remember information from the conversation history
+            - Don't ask for information that was already provided
+            - If you detect billing issues, technical problems, or complaints that need escalation, mention creating a support ticket
+            - For complex issues, offer to escalate to human support
+            - Be specific and actionable in your responses
+            - ONLY respond to e-commerce related queries (orders, payments, shipping, accounts, etc.)
+            - If a query is not e-commerce related, politely redirect to appropriate channels
+            
+            IMPORTANT CONVERSATION HANDLING:
+            - If this is a follow-up message in an ongoing conversation, use the conversation history
+            - Product names (like "aqualogica sunscreen") are valid e-commerce queries
+            - Don't treat product names or follow-up questions as off-topic
+            - Provide specific, actionable steps based on the conversation context
+            - If someone mentions a product name, assume it's related to their ongoing issue
+            
+            Context from Knowledge Base:
+            {context_text}
+            {conversation_summary}
+            """
+            
+            # Generate response using Groq
+            if not self.groq_client:
+                return "I apologize, but I'm currently unable to generate responses. Please check your API configuration."
+            
+            response = self.groq_client.chat.completions.create(
+                model="llama3-8b-8192",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ],
+                max_tokens=512,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _get_intent_specific_response(self, intent: str, query: str, conversation_context: List[Dict] = None) -> str:
+        """Generate intent-specific responses when no knowledge base content is found"""
+        try:
+            if intent == 'billing':
+                return """I understand you have a billing question. While I don't have specific information about your account in my knowledge base, I can help you with general billing information:
+
+💳 **General Billing Information:**
+- Charges are typically processed within 24-48 hours of purchase
+- Refunds take 3-5 business days to appear on your statement
+- We accept all major credit cards and PayPal
+- Monthly subscriptions are charged on the same date each month
+
+🔍 **To help you better, I need:**
+- Your order ID or account email
+- Specific billing issue (duplicate charge, refund request, etc.)
+- Date of the transaction
+
+Would you like me to create a support ticket so our billing team can assist you directly with your specific issue?"""
+            
+            elif intent == 'account':
+                return """I understand you need help with your account. Here's what I can help you with:
+
+🔐 **Account Management:**
+- Password reset (valid for 24 hours)
+- Account lockout assistance (occurs after 5 failed attempts)
+- Two-factor authentication setup
+- Profile information updates
+- Account deletion requests (processed within 30 days)
+
+🔍 **To help you better, I need:**
+- Your account email address
+- Specific account issue you're experiencing
+- Whether you can currently log in or not
+
+Would you like me to create a support ticket so our account team can assist you directly?"""
+            
+            elif intent == 'technical':
+                return """I understand you're experiencing technical issues. Here are some common solutions:
+
+🛠️ **Quick Troubleshooting Steps:**
+- Clear your browser cache and cookies
+- Check your internet connection
+- Try logging out and back in
+- Update your browser to the latest version
+- Disable browser extensions temporarily
+
+🔍 **To help you better, I need:**
+- What specific error you're seeing
+- What you were trying to do when it happened
+- Your browser and device information
+- Screenshot of the error (if possible)
+
+Would you like me to create a support ticket so our technical team can assist you directly?"""
+            
+            elif intent == 'shipping':
+                return """I understand you have shipping or delivery questions. Here's what I can tell you:
+
+📦 **Shipping Information:**
+- Standard shipping: 5-7 business days
+- Express shipping: 2-3 business days
+- Free shipping on orders over $50
+- Tracking numbers provided within 24 hours
+- International shipping available to most countries
+
+🔍 **To help you better, I need:**
+- Your order ID
+- Current shipping status
+- Whether you received a tracking number
+- Specific delivery issue you're experiencing
+
+Would you like me to create a support ticket so our shipping team can assist you directly?"""
+            
+            elif intent == 'return':
+                return """I understand you want to return an item. To process your return request, I need:
+
+🔄 **Return Requirements:**
+- Items can be returned within 30 days of purchase
+- Original packaging is required
+- Return shipping is free for defective items
+- Refunds issued to original payment method
+
+🔍 **To help you better, I need:**
+- Your order ID
+- Product name/item description
+- Reason for return
+- Whether the item is defective or just unwanted
+
+Please provide these details so I can assist you with the return process."""
+            
+            elif intent == 'complaint':
+                return """I understand you have a complaint and I want to help resolve this for you. 
+
+😔 **I'm here to listen and help:**
+- Your feedback is important to us
+- We want to understand what went wrong
+- We're committed to making things right
+
+🔍 **To help you better, I need:**
+- Your order ID (if applicable)
+- What specifically went wrong
+- When this issue occurred
+- What you expected vs. what happened
+- How we can make this right for you
+
+Would you like me to create a support ticket so our customer relations team can address your concern directly?"""
+            
+            else:
+                return """I understand you have a question, but I don't have specific information in my knowledge base to answer it accurately. 
+
+This could be because:
+- Your question is about a topic not covered in our current documentation
+- The information might be outdated or not yet added to our knowledge base
+- Your query might need more specific details
+
+🔍 **To help you better, I need:**
+- More specific details about your question
+- Any relevant order IDs or account information
+- What you're trying to accomplish
+
+I recommend:
+1. Providing more specific details about your issue
+2. Checking our FAQ section on our website
+3. Creating a support ticket for direct assistance
+
+Would you like me to create a support ticket so our team can help you directly?"""
+                
+        except Exception as e:
+            logger.error(f"Error generating intent-specific response: {e}")
+            return "I apologize, but I'm having trouble generating a response right now. Please try again or contact our support team for assistance."
     
     def is_ecommerce_related(self, query: str, conversation_context: List[Dict] = None) -> bool:
         """Check if the query is related to e-commerce customer support"""
