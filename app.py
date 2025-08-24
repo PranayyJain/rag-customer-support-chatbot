@@ -61,13 +61,13 @@ class RAGChatbot:
             'response_times': []
         }
         
-        # Intent patterns
+        # Intent patterns with better coverage
         self.intent_patterns = {
             'greeting': ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'morning', 'afternoon', 'evening'],
-            'billing': ['bill', 'charge', 'payment', 'invoice', 'money', 'cost', 'fee'],
-            'technical': ['bug', 'error', 'crash', 'not working', 'broken', 'issue', 'problem'],
-            'account': ['login', 'password', 'account', 'profile', 'sign in', 'access'],
-            'shipping': ['shipping', 'delivery', 'tracking', 'package', 'arrived', 'late', 'delayed'],
+            'billing': ['bill', 'charge', 'payment', 'invoice', 'money', 'cost', 'fee', 'billing'],
+            'technical': ['bug', 'error', 'crash', 'not working', 'broken', 'issue', 'problem', 'technical'],
+            'account': ['login', 'password', 'account', 'profile', 'sign in', 'access', 'account'],
+            'shipping': ['shipping', 'delivery', 'tracking', 'package', 'arrived', 'late', 'delayed', 'shipping', 'delivery'],
             'return': ['return', 'exchange', 'cancel', 'refund', 'send back', 'want to return', 'need to return', 'return an order', 'need refund', 'want refund'],
             'complaint': ['complaint', 'unhappy', 'disappointed', 'terrible', 'awful', 'bad'],
             'off_topic': ['sandwich', 'recipe', 'cooking', 'food', 'weather', 'sports', 'politics']
@@ -325,10 +325,24 @@ class RAGChatbot:
         return entities
     
     def classify_intent(self, text: str, entities: Dict = None) -> tuple:
-        """Classify user intent based on keywords and entities"""
+        """Classify user intent based on keywords and entities with improved logic"""
         text_lower = text.lower()
-        intent_scores = {}
         
+        # Special handling for common patterns with high confidence
+        if any(word in text_lower for word in ['delivery', 'shipping', 'package', 'tracking']):
+            return 'shipping', 0.9
+        
+        if any(word in text_lower for word in ['refund', 'return', 'exchange']):
+            return 'return', 0.9
+        
+        if any(word in text_lower for word in ['password', 'login', 'account']):
+            return 'account', 0.9
+        
+        if any(word in text_lower for word in ['bill', 'charge', 'payment', 'billing']):
+            return 'billing', 0.9
+        
+        # General pattern matching
+        intent_scores = {}
         for intent, keywords in self.intent_patterns.items():
             score = sum(1 for keyword in keywords if keyword in text_lower)
             if score > 0:
@@ -353,6 +367,10 @@ class RAGChatbot:
             if best_intent == 'greeting':
                 return 'greeting', 0.9
             
+            # Boost confidence for clear matches
+            if confidence > 0.5:
+                confidence = min(confidence + 0.3, 1.0)
+            
             return best_intent, min(confidence, 1.0)
         
         # Check for off-topic queries
@@ -364,7 +382,7 @@ class RAGChatbot:
     def search_knowledge_base(self, query: str, top_k: int = 3, conversation_context: List[Dict] = None) -> List[Dict]:
         """Search knowledge base using vector similarity with conversation context"""
         try:
-            if not self.vector_index or not self.knowledge_base:
+            if self.vector_index is None or self.knowledge_base is None or len(self.knowledge_base) == 0:
                 return []
             
             # Enhance query with conversation context if available
@@ -397,10 +415,24 @@ class RAGChatbot:
             
             # Normalize query embedding for cosine similarity
             query_norm = np.linalg.norm(query_embedding)
+            if query_norm == 0:
+                logger.warning("Query embedding has zero norm - cannot normalize")
+                return []
+            
             query_embedding = query_embedding / query_norm
             
             # Search vector index using numpy (cosine similarity)
-            similarities = np.dot(self.vector_index, query_embedding.T).flatten()
+            try:
+                similarities = np.dot(self.vector_index, query_embedding.T).flatten()
+            except Exception as e:
+                logger.error(f"Error calculating similarities: {e}")
+                return []
+            
+            # Ensure we have valid similarities before proceeding
+            if similarities.size == 0:
+                logger.warning("No similarities calculated - empty result")
+                return []
+            
             indices = np.argsort(similarities)[::-1][:top_k]  # Top k results
             scores = similarities[indices]
             
@@ -411,16 +443,26 @@ class RAGChatbot:
             
             results = []
             # Ensure both arrays are 1D and have the same length
-            if len(scores) == len(indices):
+            if len(scores) == len(indices) and len(scores) > 0:
                 for i in range(len(scores)):
-                    score = float(scores[i])
-                    idx = int(indices[i])
-                    if idx < len(self.knowledge_base):
-                        result = self.knowledge_base[idx].copy()
-                        result['similarity_score'] = score
-                        results.append(result)
+                    try:
+                        # Convert numpy types to Python types safely
+                        score = float(scores[i])
+                        idx = int(indices[i])
+                        
+                        # Validate index bounds
+                        if 0 <= idx < len(self.knowledge_base):
+                            result = self.knowledge_base[idx].copy()
+                            result['similarity_score'] = score
+                            results.append(result)
+                        else:
+                            logger.warning(f"Index {idx} out of bounds for knowledge base size {len(self.knowledge_base)}")
+                    except (ValueError, TypeError, IndexError) as e:
+                        logger.warning(f"Error processing result {i}: {e}")
+                        continue
             else:
                 logger.error(f"Array length mismatch: scores={len(scores)}, indices={len(indices)}")
+                logger.error(f"Scores length: {len(scores)}, Indices length: {len(indices)}")
             
             return results
             
@@ -483,6 +525,51 @@ For immediate assistance with non-e-commerce matters, please contact the appropr
             
             # Handle different intents appropriately when no knowledge base content is found
             if not context or len(context) == 0:
+                # Check if we have context from conversation that we can use
+                if conversation_context and len(conversation_context) > 0:
+                    # Look for entities in conversation context
+                    context_entities = {}
+                    for msg in conversation_context:
+                        if msg.get('entities'):
+                            for key, value in msg['entities'].items():
+                                if key not in context_entities:
+                                    context_entities[key] = value
+                    
+                    # If we have order_id, provide more specific help
+                    if 'order_id' in context_entities:
+                        if intent == 'shipping':
+                            return f"""Great! I can see your order ID: {context_entities['order_id']}. 
+
+📦 **Shipping Information for Order {context_entities['order_id']}:**
+- Standard shipping: 5-7 business days
+- Express shipping: 2-3 business days
+- Free shipping on orders over $50
+- Tracking numbers provided within 24 hours
+
+🔍 **To help you better, I need:**
+- Current shipping status
+- Whether you received a tracking number
+- Specific delivery issue you're experiencing
+
+Would you like me to create a support ticket so our shipping team can assist you directly?"""
+                        
+                        elif intent == 'return':
+                            return f"""Perfect! I have your order ID: {context_entities['order_id']}. 
+
+🔄 **Return Requirements:**
+- Items can be returned within 30 days of purchase
+- Original packaging is required
+- Return shipping is free for defective items
+- Refunds issued to original payment method
+
+🔍 **Now I just need:**
+- Product name/item description
+- Reason for return
+- Whether the item is defective or just unwanted
+
+Once you provide the product details, I can process your return request immediately."""
+                
+                # Fall back to intent-specific response
                 return self._get_intent_specific_response(intent, query, conversation_context)
             
             # If we have relevant context, use the API to generate a response
