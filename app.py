@@ -52,6 +52,42 @@ class RAGChatbot:
         self.vector_index = None
         self.conversation_history = {}
         self.conversation_state = {}  # Track conversation state (order_id, product, etc.)
+        
+        # Slot filling state machine
+        self.active_conversations = {}  # conversation_id -> conversation_state
+        self.slot_filling_states = {
+            'return': {
+                'required_slots': ['order_id', 'reason', 'resolution_choice'],
+                'optional_slots': ['product', 'damage_description'],
+                'current_slot': None,
+                'filled_slots': set()
+            },
+            'shipping': {
+                'required_slots': ['order_id'],
+                'optional_slots': ['shipping_issue', 'tracking_number'],
+                'current_slot': None,
+                'filled_slots': set()
+            },
+            'billing': {
+                'required_slots': ['order_id', 'billing_issue'],
+                'optional_slots': ['amount', 'date'],
+                'current_slot': None,
+                'filled_slots': set()
+            },
+            'technical': {
+                'required_slots': ['issue_description'],
+                'optional_slots': ['device', 'browser', 'error_message'],
+                'current_slot': None,
+                'filled_slots': set()
+            },
+            'account': {
+                'required_slots': ['email', 'account_issue'],
+                'optional_slots': ['username', 'last_login'],
+                'current_slot': None,
+                'filled_slots': set()
+            }
+        }
+        
         self.analytics = {
             'total_queries': 0,
             'total_tickets': 0,
@@ -498,18 +534,22 @@ class RAGChatbot:
 How can I assist you today?"""
             
             # DECISION TREE: Check if we have enough info to resolve the issue
-            resolution_result = self._check_resolution_ready(intent, entities, conversation_context)
+            resolution_result = self._check_resolution_ready(intent, entities, conversation_context, conversation_id)
             if resolution_result['can_resolve']:
-                return self._generate_resolution_response(intent, resolution_result, conversation_context)
+                # Check if this is a resolution choice
+                if resolution_result.get('is_resolution_choice', False):
+                    return self._handle_resolution_choice(intent, query, resolution_result['entities'], conversation_id)
+                else:
+                    return self._generate_resolution_response(intent, resolution_result, conversation_context)
             
             # If we can't resolve yet, ask for missing information
-            return self._ask_for_missing_info(intent, entities, conversation_context)
+            return self._ask_for_missing_info(intent, entities, conversation_context, conversation_id)
             
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
     
-    def _check_resolution_ready(self, intent: str, entities: Dict, conversation_context: List[Dict] = None) -> Dict:
+    def _check_resolution_ready(self, intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> Dict:
         """Check if we have enough information to resolve the issue"""
         try:
             # Get all entities from conversation context
@@ -524,6 +564,21 @@ How can I assist you today?"""
             # Merge with current entities
             all_entities = {**context_entities, **entities}
             
+            # Check if this is a resolution choice (final step)
+            if conversation_id and conversation_id in self.active_conversations:
+                conv_state = self.active_conversations[conversation_id]
+                locked_intent = conv_state['locked_intent']
+                
+                # Check if user is making a resolution choice
+                if locked_intent == 'return' and self._is_resolution_choice(entities, conversation_context):
+                    return {
+                        'can_resolve': True,
+                        'missing': [],
+                        'entities': all_entities,
+                        'intent': locked_intent,
+                        'is_resolution_choice': True
+                    }
+            
             # Define resolution requirements for each intent
             resolution_requirements = {
                 'shipping': {
@@ -532,14 +587,14 @@ How can I assist you today?"""
                     'can_resolve': lambda e: 'order_id' in e
                 },
                 'return': {
-                    'required': ['order_id', 'product'],
-                    'optional': ['reason'],
-                    'can_resolve': lambda e: 'order_id' in e and 'product' in e
+                    'required': ['order_id', 'reason'],
+                    'optional': ['product', 'damage_description'],
+                    'can_resolve': lambda e: 'order_id' in e and 'reason' in e
                 },
                 'billing': {
-                    'required': ['order_id'],
+                    'required': ['order_id', 'billing_issue'],
                     'optional': ['amount', 'date'],
-                    'can_resolve': lambda e: 'order_id' in e
+                    'can_resolve': lambda e: 'order_id' in e and 'billing_issue' in e
                 },
                 'technical': {
                     'required': ['issue_description'],
@@ -547,9 +602,9 @@ How can I assist you today?"""
                     'can_resolve': lambda e: 'issue_description' in e
                 },
                 'account': {
-                    'required': ['email'],
-                    'optional': ['issue_type'],
-                    'can_resolve': lambda e: 'email' in e
+                    'required': ['email', 'account_issue'],
+                    'optional': ['username', 'last_login'],
+                    'can_resolve': lambda e: 'email' in e and 'account_issue' in e
                 }
             }
             
@@ -566,12 +621,35 @@ How can I assist you today?"""
                 'can_resolve': can_resolve,
                 'missing': missing,
                 'entities': all_entities,
-                'intent': intent
+                'intent': intent,
+                'is_resolution_choice': False
             }
             
         except Exception as e:
             logger.error(f"Error checking resolution readiness: {e}")
             return {'can_resolve': False, 'missing': [], 'entities': {}, 'intent': intent}
+    
+    def _is_resolution_choice(self, entities: Dict, conversation_context: List[Dict] = None) -> bool:
+        """Check if the user is making a resolution choice (refund/replacement)"""
+        try:
+            # Check for resolution choice keywords
+            resolution_keywords = ['refund', 'replacement', 'exchange', 'money back', 'new item', 'different item']
+            
+            # Get text from conversation context
+            if conversation_context and len(conversation_context) > 0:
+                latest_message = conversation_context[-1].get('query', '').lower()
+                if any(keyword in latest_message for keyword in resolution_keywords):
+                    return True
+            
+            # Check current entities for resolution choice
+            if 'refund' in str(entities).lower() or 'replacement' in str(entities).lower():
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking resolution choice: {e}")
+            return False
     
     def _generate_resolution_response(self, intent: str, resolution_result: Dict, conversation_context: List[Dict] = None) -> str:
         """Generate resolution response when we have enough information"""
@@ -693,10 +771,25 @@ Is there anything else I can help you with today?"""
             logger.error(f"Error generating resolution response: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
     
-    def _ask_for_missing_info(self, intent: str, entities: Dict, conversation_context: List[Dict] = None) -> str:
-        """Ask for missing information based on intent and current entities"""
+    def _ask_for_missing_info(self, intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> str:
+        """Ask for missing information using slot-filling state machine"""
         try:
-            # Get all entities from conversation context
+            # Get or create conversation state
+            if conversation_id not in self.active_conversations:
+                self.active_conversations[conversation_id] = {
+                    'locked_intent': intent,
+                    'current_slot': None,
+                    'filled_slots': set(),
+                    'slot_data': {}
+                }
+            
+            conv_state = self.active_conversations[conversation_id]
+            
+            # Lock the intent for this conversation
+            if not conv_state['locked_intent']:
+                conv_state['locked_intent'] = intent
+            
+            # Get all entities from conversation context and current message
             context_entities = {}
             if conversation_context and len(conversation_context) > 0:
                 for msg in conversation_context:
@@ -704,59 +797,100 @@ Is there anything else I can help you with today?"""
                         for key, value in msg['entities'].items():
                             if key not in context_entities:
                                 context_entities[key] = value
+                                conv_state['slot_data'][key] = value
+                                conv_state['filled_slots'].add(key)
             
             # Merge with current entities
             all_entities = {**context_entities, **entities}
+            for key, value in entities.items():
+                conv_state['slot_data'][key] = value
+                conv_state['filled_slots'].add(key)
             
-            # Define what we need for each intent
-            intent_requirements = {
-                'shipping': {
-                    'primary': 'order ID',
-                    'secondary': 'specific shipping issue',
-                    'example': 'e.g., "Where is my order 12345?" or "My package is delayed"'
-                },
-                'return': {
-                    'primary': 'order ID and product name',
-                    'secondary': 'reason for return',
-                    'example': 'e.g., "I want to return order 12345, I received the wrong shampoo"'
-                },
-                'billing': {
-                    'primary': 'order ID or transaction ID',
-                    'secondary': 'specific billing issue',
-                    'example': 'e.g., "I was charged twice for order 12345"'
-                },
-                'technical': {
-                    'primary': 'description of the technical issue',
-                    'secondary': 'device/browser information',
-                    'example': 'e.g., "I can\'t log into my account" or "The app keeps crashing"'
-                },
-                'account': {
-                    'primary': 'email address',
-                    'secondary': 'specific account issue',
-                    'example': 'e.g., "I forgot my password for john@email.com"'
-                }
-            }
+            # Use the locked intent, not the current classified intent
+            locked_intent = conv_state['locked_intent']
             
-            if intent not in intent_requirements:
-                return """I understand you need help, but I need more specific information to assist you properly.
+            # Check what slots we need and what we have
+            if locked_intent not in self.slot_filling_states:
+                return self._get_intent_specific_response(intent, "", conversation_context)
+            
+            slot_state = self.slot_filling_states[locked_intent]
+            required_slots = slot_state['required_slots']
+            optional_slots = slot_state['optional_slots']
+            
+            # Find missing required slots
+            missing_slots = [slot for slot in required_slots if slot not in conv_state['filled_slots']]
+            
+            if not missing_slots:
+                # All required slots filled, ask for resolution choice
+                return self._ask_for_resolution_choice(locked_intent, conv_state['slot_data'])
+            
+            # Ask for the next missing slot
+            next_slot = missing_slots[0]
+            conv_state['current_slot'] = next_slot
+            
+            return self._ask_for_specific_slot(locked_intent, next_slot, conv_state['slot_data'])
+            
+        except Exception as e:
+            logger.error(f"Error asking for missing info: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _ask_for_specific_slot(self, intent: str, slot_name: str, slot_data: Dict) -> str:
+        """Ask for a specific slot in the slot-filling flow"""
+        try:
+            if intent == 'return':
+                if slot_name == 'order_id':
+                    return """🔄 **Return Request**
 
-🔍 **To help you better, please provide:**
-- What specific issue you're experiencing
-- Any relevant order IDs or account details
-- What you were trying to do when the problem occurred
+I'd be happy to help you with your return!
 
-This will help me create the right type of support ticket for you."""
+🔍 **I need your order ID to assist you:**
+- Please provide your order number
+- You can find this in your order confirmation email
+
+**Example:** "I want to return order 12345"
+
+Once you provide the order ID, I can help process your return request."""
+                
+                elif slot_name == 'reason':
+                    order_id = slot_data.get('order_id', 'your order')
+                    return f"""✅ **Order ID Received: {order_id}**
+
+Great! Now I need to know the reason for your return:
+
+🔍 **Why are you returning this item?**
+- Damaged or defective product
+- Wrong item received
+- Size doesn't fit
+- Changed your mind
+- Other reason
+
+**Example:** "The product was damaged during shipping" or "I received the wrong item"
+
+Once you tell me the reason, I can process your return request."""
+                
+                elif slot_name == 'resolution_choice':
+                    order_id = slot_data.get('order_id', 'your order')
+                    reason = slot_data.get('reason', 'your return reason')
+                    return f"""✅ **Return Details Complete**
+
+Perfect! I have all the information I need:
+- Order ID: {order_id}
+- Reason: {reason}
+
+Now I need to know your preference:
+
+🔍 **What would you like?**
+- **Refund**: Money back to your original payment method
+- **Replacement**: Same item shipped to you again
+- **Exchange**: Different item of equal value
+
+**Example:** "I want a refund" or "I'd like a replacement"
+
+Once you choose, I can immediately process your request and create a support ticket."""
             
-            req = intent_requirements[intent]
-            
-            # Check what we already have
-            has_order_id = 'order_id' in all_entities
-            has_product = 'product' in all_entities
-            has_email = 'email' in all_entities
-            
-            # Build response based on what's missing
-            if intent == 'shipping' and not has_order_id:
-                return f"""📦 **Shipping Assistance**
+            elif intent == 'shipping':
+                if slot_name == 'order_id':
+                    return """📦 **Shipping Assistance**
 
 I'd be happy to help with your shipping concern!
 
@@ -769,36 +903,9 @@ I'd be happy to help with your shipping concern!
 
 Once you provide the order ID, I can immediately create a support ticket and get our shipping team involved."""
             
-            elif intent == 'return':
-                if not has_order_id:
-                    return f"""🔄 **Return Request**
-
-I'd be happy to help you with your return!
-
-🔍 **I need your order ID to assist you:**
-- Please provide your order number
-- You can find this in your order confirmation email
-
-**Example:** "I want to return order 12345"
-
-Once you provide the order ID, I can help process your return request."""
-                elif not has_product:
-                    order_id = all_entities.get('order_id', 'your order')
-                    return f"""✅ **Order ID Received: {order_id}**
-
-Great! Now I just need:
-
-🔍 **Product Information:**
-- What product did you receive?
-- What product did you order?
-- Is it the wrong item, defective, or unwanted?
-
-**Example:** "I ordered Head & Shoulders shampoo but received sunscreen"
-
-Once you provide the product details, I can immediately process your return request and create a support ticket."""
-            
-            elif intent == 'billing' and not has_order_id:
-                return f"""💳 **Billing Assistance**
+            elif intent == 'billing':
+                if slot_name == 'order_id':
+                    return """💳 **Billing Assistance**
 
 I'd be happy to help with your billing concern!
 
@@ -810,9 +917,28 @@ I'd be happy to help with your billing concern!
 **Example:** "I was charged twice for order 12345"
 
 Once you provide the order ID, I can immediately investigate and create a support ticket."""
+                
+                elif slot_name == 'billing_issue':
+                    order_id = slot_data.get('order_id', 'your order')
+                    return f"""✅ **Order ID Received: {order_id}**
+
+Great! Now I need to know the specific billing issue:
+
+🔍 **What billing problem are you experiencing?**
+- Duplicate charge
+- Incorrect amount charged
+- Payment failed
+- Refund not received
+- Subscription billing issue
+- Other billing concern
+
+**Example:** "I was charged twice for the same order" or "My payment failed during checkout"
+
+Once you describe the issue, I can investigate and create a support ticket."""
             
             elif intent == 'technical':
-                return f"""🛠️ **Technical Support**
+                if slot_name == 'issue_description':
+                    return """🛠️ **Technical Support**
 
 I'd be happy to help with your technical issue!
 
@@ -830,8 +956,8 @@ I'd be happy to help with your technical issue!
 Once you provide details, I can create a support ticket for our technical team."""
             
             elif intent == 'account':
-                if not has_email:
-                    return f"""🔐 **Account Support**
+                if slot_name == 'email':
+                    return """🔐 **Account Support**
 
 I'd be happy to help with your account issue!
 
@@ -842,38 +968,176 @@ I'd be happy to help with your account issue!
 **Example:** "I can't log into john@email.com"
 
 Once you provide your email, I can immediately assist with your account concern."""
-                else:
-                    email = all_entities.get('email', 'your account')
+                
+                elif slot_name == 'account_issue':
+                    email = slot_data.get('email', 'your account')
                     return f"""✅ **Email Received: {email}**
 
-Great! Now I just need:
+Great! Now I need to know the specific account issue:
 
-🔍 **Specific Account Issue:**
-- What exactly is the problem?
-- Can you currently log in?
-- Are you locked out?
-- Do you need password reset?
+🔍 **What account problem are you experiencing?**
+- Can't log in
+- Forgot password
+- Account locked
+- Need to update profile
+- Two-factor authentication issue
+- Other account concern
 
 **Examples:**
 - "I forgot my password"
-- "My account is locked"
-- "I need to update my profile"
+- "My account is locked after too many failed attempts"
+- "I need to update my email address"
 
-Once you describe the issue, I can immediately assist you and create a support ticket if needed."""
+Once you describe the issue, I can assist you and create a support ticket if needed."""
             
             else:
-                return f"""I understand you need help with {intent}, but I need more specific information to assist you properly.
+                return f"""I need more information to help you with your {intent} request.
 
-🔍 **To help you better, please provide:**
-- {req['primary']}
-- {req['secondary']}
+🔍 **Please provide:**
+- {slot_name.replace('_', ' ').title()}
 
-**Example:** {req['example']}
-
-This will help me create the right type of support ticket and get you the help you need."""
+This will help me assist you properly."""
                 
         except Exception as e:
-            logger.error(f"Error asking for missing info: {e}")
+            logger.error(f"Error asking for specific slot: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _ask_for_resolution_choice(self, intent: str, slot_data: Dict) -> str:
+        """Ask for resolution choice when all required slots are filled"""
+        try:
+            if intent == 'return':
+                order_id = slot_data.get('order_id', 'your order')
+                reason = slot_data.get('reason', 'your return reason')
+                return f"""✅ **Return Details Complete**
+
+Perfect! I have all the information I need:
+- Order ID: {order_id}
+- Reason: {reason}
+
+Now I need to know your preference:
+
+🔍 **What would you like?**
+- **Refund**: Money back to your original payment method
+- **Replacement**: Same item shipped to you again
+- **Exchange**: Different item of equal value
+
+**Example:** "I want a refund" or "I'd like a replacement"
+
+Once you choose, I can immediately process your request and create a support ticket."""
+            
+            else:
+                return """✅ **Information Complete**
+
+I have all the information I need to help you!
+
+🎫 **Support Ticket Created**
+- Our team will contact you within 2 hours
+- We'll work to resolve your issue promptly
+- You'll receive regular updates
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error asking for resolution choice: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _handle_resolution_choice(self, intent: str, choice: str, slot_data: Dict, conversation_id: str) -> str:
+        """Handle the user's resolution choice and create final ticket"""
+        try:
+            if intent == 'return':
+                order_id = slot_data.get('order_id', 'your order')
+                reason = slot_data.get('reason', 'your return reason')
+                
+                if 'refund' in choice.lower():
+                    # Clear conversation state after resolution
+                    if conversation_id in self.active_conversations:
+                        del self.active_conversations[conversation_id]
+                    
+                    return f"""✅ **Refund Request Processed Successfully!**
+
+Perfect! I've processed your refund request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Refund to original payment method
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Refund request
+- Priority: High
+- Status: Processing
+
+📋 **Next Steps:**
+- Refund will be processed within 3-5 business days
+- You'll receive email confirmation
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+💰 **Refund Timeline:**
+- Processing: 1-2 business days
+- Bank processing: 3-5 business days
+- Appears on your statement within 5-7 days
+
+Is there anything else I can help you with today?"""
+                
+                elif 'replacement' in choice.lower():
+                    # Clear conversation state after resolution
+                    if conversation_id in self.active_conversations:
+                        del self.active_conversations[conversation_id]
+                    
+                    return f"""✅ **Replacement Request Processed Successfully!**
+
+Perfect! I've processed your replacement request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Replacement item
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Replacement request
+- Priority: High
+- Status: Processing
+
+📦 **Next Steps:**
+- Replacement will be shipped within 24 hours
+- You'll receive new tracking number
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+🚚 **Shipping Timeline:**
+- Processing: Same day
+- Shipping: Next business day
+- Delivery: 3-5 business days
+
+Is there anything else I can help you with today?"""
+                
+                else:
+                    return """I didn't catch your preference clearly. 
+
+🔍 **Please choose one of these options:**
+- **Refund**: "I want a refund"
+- **Replacement**: "I'd like a replacement"
+- **Exchange**: "I want to exchange for something else"
+
+Which would you prefer?"""
+            
+            else:
+                # Clear conversation state after resolution
+                if conversation_id in self.active_conversations:
+                    del self.active_conversations[conversation_id]
+                
+                return """✅ **Issue Resolved Successfully!**
+
+I've processed your request and created a support ticket.
+
+🎫 **Support Ticket Created**
+- Our team will contact you within 2 hours
+- We'll work to resolve your issue promptly
+- You'll receive regular updates
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error handling resolution choice: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
     
     def _get_intent_specific_response(self, intent: str, query: str, conversation_context: List[Dict] = None) -> str:
