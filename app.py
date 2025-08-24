@@ -2,7 +2,7 @@ import os
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Union
 from difflib import SequenceMatcher
 
 import numpy as np
@@ -107,7 +107,7 @@ class RAGChatbot:
         self.conversation_state = {}  # Track conversation state (order_id, product, etc.)
         
         # DST Flow Engine Methods
-        def normalize_intent(self, raw_text: str) -> str | None:
+        def normalize_intent(self, raw_text: str) -> Union[str, None]:
             """Normalize intent with typo handling using difflib"""
             t = raw_text.lower().strip()
             
@@ -142,7 +142,7 @@ class RAGChatbot:
             """Check if a flow is active for this conversation"""
             return conv_id in self.user_states
         
-        def active_flow(self, conv_id: str) -> str | None:
+        def active_flow(self, conv_id: str) -> Union[str, None]:
             """Get the active flow for this conversation"""
             return self.user_states.get(conv_id, {}).get("flow")
         
