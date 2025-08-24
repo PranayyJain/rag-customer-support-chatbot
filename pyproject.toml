@@ -6,12 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "rag-customer-support-chatbot"
 version = "1.0.0"
 description = "AI-powered customer support chatbot using RAG"
-requires-python = ">=3.9,<3.12"
+requires-python = "~3.9.18"
 dependencies = [
     "Flask==2.3.3",
     "Flask-CORS==4.0.0",
     "cohere==4.37",
-    "groq==0.4.3",
+    "groq==0.4.2",
     "PyPDF2==3.0.1",
     "numpy==1.26.4",
     "python-dotenv==1.0.0",

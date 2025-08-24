@@ -4,13 +4,15 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.9.18
-      - key: FLASK_ENV
-        value: production
-      - key: FLASK_DEBUG
-        value: false
+                    envVars:
+                  - key: PYTHON_VERSION
+                    value: 3.9.18
+                  - key: PIP_FORCE_VERSION
+                    value: 3.9
+                  - key: FLASK_ENV
+                    value: production
+                  - key: FLASK_DEBUG
+                    value: false
     buildFilter:
       paths:
         - "requirements.txt"
