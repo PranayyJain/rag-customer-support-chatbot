@@ -392,7 +392,7 @@ class RAGChatbot:
             scores = similarities[indices]
             
             results = []
-            for score, idx in zip(scores[0], indices[0]):
+            for score, idx in zip(scores, indices):
                 if idx < len(self.knowledge_base):
                     result = self.knowledge_base[idx].copy()
                     result['similarity_score'] = float(score)
