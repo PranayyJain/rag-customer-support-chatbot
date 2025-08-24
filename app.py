@@ -53,38 +53,90 @@ class RAGChatbot:
         self.conversation_history = {}
         self.conversation_state = {}  # Track conversation state (order_id, product, etc.)
         
-        # Slot filling state machine
+        # Active conversation state tracking
         self.active_conversations = {}  # conversation_id -> conversation_state
-        self.slot_filling_states = {
+        
+        # Config-driven conversation flows (declarative, not hardcoded)
+        self.conversation_flows = {
             'return': {
-                'required_slots': ['order_id', 'reason', 'resolution_choice'],
-                'optional_slots': ['product', 'damage_description'],
-                'current_slot': None,
-                'filled_slots': set()
+                'steps': [
+                    {
+                        'entity': 'order_id',
+                        'ask': '🔄 **Return Request**\n\nI\'d be happy to help you with your return!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n\n**Example:** "I want to return order 12345"\n\nOnce you provide the order ID, I can help process your return request.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    },
+                    {
+                        'entity': 'reason',
+                        'ask': lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the reason for your return:\n\n🔍 **Why are you returning this item?**\n- Damaged or defective product\n- Wrong item received\n- Size doesn\'t fit\n- Changed your mind\n- Other reason\n\n**Example:** "The product was damaged during shipping" or "I received the wrong item"\n\nOnce you tell me the reason, I can process your return request.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    },
+                    {
+                        'entity': 'resolution_choice',
+                        'ask': lambda data: f'✅ **Return Details Complete**\n\nPerfect! I have all the information I need:\n- Order ID: {data.get("order_id", "your order")}\n- Reason: {data.get("reason", "your return reason")}\n\nNow I need to know your preference:\n\n🔍 **What would you like?**\n- **Refund**: Money back to your original payment method\n- **Replacement**: Same item shipped to you again\n- **Exchange**: Different item of equal value\n\n**Example:** "I want a refund" or "I\'d like a replacement"\n\nOnce you choose, I can immediately process your request and create a support ticket.',
+                        'validation': lambda x: bool(x and any(word in str(x).lower() for word in ['refund', 'replacement', 'exchange']))
+                    }
+                ],
+                'finalize': lambda data: self._finalize_return_flow(data)
             },
             'shipping': {
-                'required_slots': ['order_id'],
-                'optional_slots': ['shipping_issue', 'tracking_number'],
-                'current_slot': None,
-                'filled_slots': set()
+                'steps': [
+                    {
+                        'entity': 'order_id',
+                        'ask': '📦 **Shipping Assistance**\n\nI\'d be happy to help with your shipping concern!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n- Or check your account order history\n\n**Example:** "My order ID is 12345" or "Where is order 12345?"\n\nOnce you provide the order ID, I can immediately create a support ticket and get our shipping team involved.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    },
+                    {
+                        'entity': 'shipping_issue',
+                        'ask': lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific shipping issue:\n\n🔍 **What shipping problem are you experiencing?**\n- Package not delivered\n- Delayed delivery\n- Wrong address\n- Damaged package\n- Tracking not working\n- Other shipping concern\n\n**Example:** "My package was supposed to arrive yesterday but it\'s still not here"\n\nOnce you describe the issue, I can create a support ticket for our shipping team.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    }
+                ],
+                'finalize': lambda data: self._finalize_shipping_flow(data)
             },
             'billing': {
-                'required_slots': ['order_id', 'billing_issue'],
-                'optional_slots': ['amount', 'date'],
-                'current_slot': None,
-                'filled_slots': set()
+                'steps': [
+                    {
+                        'entity': 'order_id',
+                        'ask': '💳 **Billing Assistance**\n\nI\'d be happy to help with your billing concern!\n\n🔍 **I need your order ID or transaction ID:**\n- Please provide your order number\n- Or the transaction ID from your bank statement\n- You can find this in your order confirmation email\n\n**Example:** "I was charged twice for order 12345"\n\nOnce you provide the order ID, I can immediately investigate and create a support ticket.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    },
+                    {
+                        'entity': 'billing_issue',
+                        'ask': lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific billing issue:\n\n🔍 **What billing problem are you experiencing?**\n- Duplicate charge\n- Incorrect amount charged\n- Payment failed\n- Refund not received\n- Subscription billing issue\n- Other billing concern\n\n**Example:** "I was charged twice for the same order" or "My payment failed during checkout"\n\nOnce you describe the issue, I can investigate and create a support ticket.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    }
+                ],
+                'finalize': lambda data: self._finalize_billing_flow(data)
             },
             'technical': {
-                'required_slots': ['issue_description'],
-                'optional_slots': ['device', 'browser', 'error_message'],
-                'current_slot': None,
-                'filled_slots': set()
+                'steps': [
+                    {
+                        'entity': 'issue_description',
+                        'ask': '🛠️ **Technical Support**\n\nI\'d be happy to help with your technical issue!\n\n🔍 **Please describe the problem:**\n- What exactly is happening?\n- What were you trying to do?\n- What error messages do you see?\n- What device/browser are you using?\n\n**Examples:**\n- "I can\'t log into my account"\n- "The app keeps crashing on my iPhone"\n- "I get an error when trying to checkout"\n\nOnce you provide details, I can create a support ticket for our technical team.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    },
+                    {
+                        'entity': 'device_info',
+                        'ask': lambda data: f'✅ **Issue Description Received**\n\nGreat! I understand: {data.get("issue_description", "your technical issue")}\n\nNow I need to know your device information:\n\n🔍 **What device/browser are you using?**\n- Device type (iPhone, Android, Windows, Mac, etc.)\n- Browser (Chrome, Safari, Firefox, Edge)\n- App version (if using mobile app)\n- Operating system version\n\n**Example:** "iPhone 14 with iOS 17, using Safari"\n\nOnce you provide this, I can create a support ticket for our technical team.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    }
+                ],
+                'finalize': lambda data: self._finalize_technical_flow(data)
             },
             'account': {
-                'required_slots': ['email', 'account_issue'],
-                'optional_slots': ['username', 'last_login'],
-                'current_slot': None,
-                'filled_slots': set()
+                'steps': [
+                    {
+                        'entity': 'email',
+                        'ask': '🔐 **Account Support**\n\nI\'d be happy to help with your account issue!\n\n🔍 **I need your email address:**\n- Please provide the email associated with your account\n- This helps me verify your identity and access\n\n**Example:** "I can\'t log into john@email.com"\n\nOnce you provide your email, I can immediately assist with your account concern.',
+                        'validation': lambda x: bool(x and '@' in str(x))
+                    },
+                    {
+                        'entity': 'account_issue',
+                        'ask': lambda data: f'✅ **Email Received: {data.get("email", "your account")}**\n\nGreat! Now I need to know the specific account issue:\n\n🔍 **What account problem are you experiencing?**\n- Can\'t log in\n- Forgot password\n- Account locked\n- Need to update profile\n- Two-factor authentication issue\n- Other account concern\n\n**Examples:**\n- "I forgot my password"\n- "My account is locked after too many failed attempts"\n- "I need to update my email address"\n\nOnce you describe the issue, I can assist you and create a support ticket if needed.',
+                        'validation': lambda x: bool(x and str(x).strip())
+                    }
+                ],
+                'finalize': lambda data: self._finalize_account_flow(data)
             }
         }
         
@@ -368,6 +420,21 @@ class RAGChatbot:
     def classify_intent(self, text: str, entities: Dict = None) -> tuple:
         """Classify user intent based on keywords and entities with improved logic"""
         text_lower = text.lower()
+        
+        # Fuzzy matching for common typos and variations
+        fuzzy_patterns = {
+            'return': ['refund', 'return', 'exchange', 'redund', 'refun', 'retun', 'exchnge', 'exchage'],
+            'shipping': ['delivery', 'shipping', 'package', 'tracking', 'shippng', 'delivry', 'packge'],
+            'billing': ['bill', 'charge', 'payment', 'billing', 'bil', 'chage', 'paymnt'],
+            'account': ['password', 'login', 'account', 'profile', 'sign in', 'access', 'acount', 'logn'],
+            'technical': ['bug', 'error', 'crash', 'not working', 'broken', 'issue', 'problem', 'technical', 'tech', 'workng']
+        }
+        
+        # Check for fuzzy matches first
+        for intent, patterns in fuzzy_patterns.items():
+            for pattern in patterns:
+                if pattern in text_lower:
+                    return intent, 0.9
         
         # Special handling for common patterns with high confidence
         if any(word in text_lower for word in ['delivery', 'shipping', 'package', 'tracking']):
@@ -772,15 +839,15 @@ Is there anything else I can help you with today?"""
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
     
     def _ask_for_missing_info(self, intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> str:
-        """Ask for missing information using slot-filling state machine"""
+        """Ask for missing information using config-driven state machine"""
         try:
             # Get or create conversation state
             if conversation_id not in self.active_conversations:
                 self.active_conversations[conversation_id] = {
-                    'locked_intent': intent,
-                    'current_slot': None,
-                    'filled_slots': set(),
-                    'slot_data': {}
+                    'flow': intent,
+                    'current_step': 0,
+                    'data': {},
+                    'locked_intent': intent
                 }
             
             conv_state = self.active_conversations[conversation_id]
@@ -797,41 +864,311 @@ Is there anything else I can help you with today?"""
                         for key, value in msg['entities'].items():
                             if key not in context_entities:
                                 context_entities[key] = value
-                                conv_state['slot_data'][key] = value
-                                conv_state['filled_slots'].add(key)
+                                conv_state['data'][key] = value
             
             # Merge with current entities
             all_entities = {**context_entities, **entities}
             for key, value in entities.items():
-                conv_state['slot_data'][key] = value
-                conv_state['filled_slots'].add(key)
+                conv_state['data'][key] = value
             
             # Use the locked intent, not the current classified intent
             locked_intent = conv_state['locked_intent']
             
-            # Check what slots we need and what we have
-            if locked_intent not in self.slot_filling_states:
+            # Check if we have a flow defined for this intent
+            if locked_intent not in self.conversation_flows:
                 return self._get_intent_specific_response(intent, "", conversation_context)
             
-            slot_state = self.slot_filling_states[locked_intent]
-            required_slots = slot_state['required_slots']
-            optional_slots = slot_state['optional_slots']
+            flow = self.conversation_flows[locked_intent]
+            current_step = conv_state['current_step']
             
-            # Find missing required slots
-            missing_slots = [slot for slot in required_slots if slot not in conv_state['filled_slots']]
-            
-            if not missing_slots:
-                # All required slots filled, ask for resolution choice
-                return self._ask_for_resolution_choice(locked_intent, conv_state['slot_data'])
-            
-            # Ask for the next missing slot
-            next_slot = missing_slots[0]
-            conv_state['current_slot'] = next_slot
-            
-            return self._ask_for_specific_slot(locked_intent, next_slot, conv_state['slot_data'])
+            # Check if we can move to the next step
+            if current_step < len(flow['steps']):
+                step = flow['steps'][current_step]
+                entity_name = step['entity']
+                
+                # Check if we have the data for this step
+                if entity_name in conv_state['data']:
+                    # Validate the data
+                    if step['validation'](conv_state['data'][entity_name]):
+                        # Move to next step
+                        conv_state['current_step'] += 1
+                        current_step = conv_state['current_step']
+                        
+                        # If we've completed all steps, finalize the flow
+                        if current_step >= len(flow['steps']):
+                            return flow['finalize'](conv_state['data'])
+                        else:
+                            # Ask for next step
+                            next_step = flow['steps'][current_step]
+                            next_ask = next_step['ask']
+                            # Handle dynamic questions (lambda functions)
+                            if callable(next_ask):
+                                return next_ask(conv_state['data'])
+                            else:
+                                return next_ask
+                    else:
+                        # Data validation failed, ask again
+                        ask = step['ask']
+                        if callable(ask):
+                            return ask(conv_state['data'])
+                        else:
+                            return ask
+                else:
+                    # Ask for current step data
+                    ask = step['ask']
+                    if callable(ask):
+                        return ask(conv_state['data'])
+                    else:
+                        return ask
+            else:
+                # All steps completed, finalize the flow
+                return flow['finalize'](conv_state['data'])
             
         except Exception as e:
             logger.error(f"Error asking for missing info: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_return_flow(self, data: Dict) -> str:
+        """Finalize return flow and create support ticket"""
+        try:
+            order_id = data.get('order_id', 'your order')
+            reason = data.get('reason', 'your return reason')
+            resolution = data.get('resolution_choice', 'refund')
+            
+            # Clear conversation state after resolution
+            if hasattr(self, 'active_conversations'):
+                # Find and clear the conversation
+                for conv_id, conv_state in list(self.active_conversations.items()):
+                    if conv_state.get('flow') == 'return':
+                        del self.active_conversations[conv_id]
+                        break
+            
+            if 'refund' in resolution.lower():
+                return f"""✅ **Refund Request Processed Successfully!**
+
+Perfect! I've processed your refund request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Refund to original payment method
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Refund request
+- Priority: High
+- Status: Processing
+
+📋 **Next Steps:**
+- Refund will be processed within 3-5 business days
+- You'll receive email confirmation
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+💰 **Refund Timeline:**
+- Processing: 1-2 business days
+- Bank processing: 3-5 business days
+- Appears on your statement within 5-7 days
+
+Is there anything else I can help you with today?"""
+            
+            elif 'replacement' in resolution.lower():
+                return f"""✅ **Replacement Request Processed Successfully!**
+
+Perfect! I've processed your replacement request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Replacement item
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Replacement request
+- Priority: High
+- Status: Processing
+
+📦 **Next Steps:**
+- Replacement will be shipped within 24 hours
+- You'll receive new tracking number
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+🚚 **Shipping Timeline:**
+- Processing: Same day
+- Shipping: Next business day
+- Delivery: 3-5 business days
+
+Is there anything else I can help you with today?"""
+            
+            else:
+                return f"""✅ **Exchange Request Processed Successfully!**
+
+Perfect! I've processed your exchange request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Exchange for different item
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Exchange request
+- Priority: High
+- Status: Processing
+
+🔄 **Next Steps:**
+- Exchange will be processed within 24 hours
+- You'll receive new tracking number
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing return flow: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_shipping_flow(self, data: Dict) -> str:
+        """Finalize shipping flow and create support ticket"""
+        try:
+            order_id = data.get('order_id', 'your order')
+            shipping_issue = data.get('shipping_issue', 'your shipping concern')
+            
+            # Clear conversation state
+            if hasattr(self, 'active_conversations'):
+                for conv_id, conv_state in list(self.active_conversations.items()):
+                    if conv_state.get('flow') == 'shipping':
+                        del self.active_conversations[conv_id]
+                        break
+            
+            return f"""✅ **Shipping Issue Addressed Successfully!**
+
+Perfect! I've processed your shipping concern:
+- Order ID: {order_id}
+- Issue: {shipping_issue}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Shipping inquiry
+- Priority: Normal
+- Status: Processing
+
+📦 **Next Steps:**
+- Our shipping team will review your order within 2 hours
+- You'll receive current shipping status and tracking information
+- Any necessary actions will be communicated promptly
+- Estimated delivery updates will be provided
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing shipping flow: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_billing_flow(self, data: Dict) -> str:
+        """Finalize billing flow and create support ticket"""
+        try:
+            order_id = data.get('order_id', 'your order')
+            billing_issue = data.get('billing_issue', 'your billing concern')
+            
+            # Clear conversation state
+            if hasattr(self, 'active_conversations'):
+                for conv_id, conv_state in list(self.active_conversations.items()):
+                    if conv_state.get('flow') == 'billing':
+                        del self.active_conversations[conv_id]
+                        break
+            
+            return f"""✅ **Billing Issue Addressed Successfully!**
+
+Perfect! I've processed your billing concern:
+- Order ID: {order_id}
+- Issue: {billing_issue}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Billing inquiry
+- Priority: Normal
+- Status: Processing
+
+💳 **Next Steps:**
+- Our billing team will investigate within 2 hours
+- You'll receive detailed analysis of the issue
+- Any necessary refunds will be processed promptly
+- Payment method updates will be arranged if needed
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing billing flow: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_technical_flow(self, data: Dict) -> str:
+        """Finalize technical flow and create support ticket"""
+        try:
+            issue_description = data.get('issue_description', 'your technical issue')
+            device_info = data.get('device_info', 'your device information')
+            
+            # Clear conversation state
+            if hasattr(self, 'active_conversations'):
+                for conv_id, conv_state in list(self.active_conversations.items()):
+                    if conv_state.get('flow') == 'technical':
+                        del self.active_conversations[conv_id]
+                        break
+            
+            return f"""✅ **Technical Issue Logged Successfully!**
+
+Perfect! I've recorded your technical concern:
+- Issue: {issue_description}
+- Device: {device_info}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Technical support
+- Priority: Normal
+- Status: Processing
+
+🛠️ **Next Steps:**
+- Our technical team will contact you within 2 hours
+- We'll provide step-by-step troubleshooting solutions
+- If needed, we'll escalate to senior technicians
+- We'll follow up until the issue is resolved
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing technical flow: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_account_flow(self, data: Dict) -> str:
+        """Finalize account flow and create support ticket"""
+        try:
+            email = data.get('email', 'your account')
+            account_issue = data.get('account_issue', 'your account concern')
+            
+            # Clear conversation state
+            if hasattr(self, 'active_conversations'):
+                for conv_id, conv_state in list(self.active_conversations.items()):
+                    if conv_state.get('flow') == 'account':
+                        del self.active_conversations[conv_id]
+                        break
+            
+            return f"""✅ **Account Issue Addressed Successfully!**
+
+Perfect! I've processed your account concern:
+- Email: {email}
+- Issue: {account_issue}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Account support
+- Priority: Normal
+- Status: Processing
+
+🔐 **Next Steps:**
+- Our account team will contact you within 2 hours
+- We'll verify your identity and resolve the issue
+- Any necessary instructions will be provided
+- We'll ensure secure access to your account
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing account flow: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
     
     def _ask_for_specific_slot(self, intent: str, slot_name: str, slot_data: Dict) -> str:
