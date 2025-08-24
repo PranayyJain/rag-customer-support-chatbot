@@ -70,11 +70,24 @@ class RAGChatbot:
                     {"key": "account_issue", "ask": lambda data: f'✅ **Email Received: {data.get("email", "your account")}**\n\nGreat! Now I need to know the specific account issue:\n\n🔍 **What account problem are you experiencing?**\n- Can\'t log in\n- Forgot password\n- Account locked\n- Need to update profile\n- Two-factor authentication issue\n- Other account concern\n\n**Examples:**\n- \"I forgot my password\"\n- \"My account is locked after too many failed attempts\"\n- \"I need to update my email address\"\n\nOnce you describe the issue, I can assist you and create a support ticket if needed.'}
                 ],
                 "finalize": lambda data: self._finalize_account_flow_dst(data)
+            },
+            "greeting": {
+                "required_slots": [],
+                "finalize": lambda data: """Hello! I'm your AI customer support assistant. I can help you with:
+
+🔐 Account and password issues
+💳 Billing and payment questions
+🛠️ Technical support
+📦 Shipping and delivery
+🔄 Returns and refunds
+
+How can I assist you today?"""
             }
         }
         
         # Intent canonical mapping with typo handling
         self.intent_canonical = {
+            "greeting": {"hi", "hello", "hey", "good morning", "good afternoon", "good evening", "morning", "afternoon", "evening"},
             "return": {"return", "refund", "replacement", "exchange", "redund", "refnd", "reund"},
             "shipping": {"shipping", "delivery", "track", "status", "package", "arrived", "late", "delayed"},
             "billing": {"billing", "payment", "charge", "invoice", "bill", "money", "cost", "fee"},
@@ -105,120 +118,6 @@ class RAGChatbot:
         self.vector_index = None
         self.conversation_history = {}
         self.conversation_state = {}  # Track conversation state (order_id, product, etc.)
-        
-        # DST Flow Engine Methods
-        def normalize_intent(self, raw_text: str) -> Union[str, None]:
-            """Normalize intent with typo handling using difflib"""
-            t = raw_text.lower().strip()
-            
-            # Quick patches for common typos
-            quick_map = {"redund": "refund", "refnd": "refund", "reund": "refund", "shippng": "shipping", "delivry": "delivery"}
-            for k, v in quick_map.items():
-                if k in t:
-                    t = t.replace(k, v)
-            
-            # Try exact hit first
-            for intent, vocab in self.intent_canonical.items():
-                if any(word in t for word in vocab):
-                    return intent
-            
-            # Fuzzy: best approximate across all canonical words
-            best_score, best_intent = 0.0, None
-            for intent, vocab in self.intent_canonical.items():
-                for word in vocab:
-                    s = SequenceMatcher(None, t, word).ratio()
-                    if s > best_score:
-                        best_score, best_intent = s, intent
-            
-            return best_intent if best_score >= 0.65 else None
-        
-        def start_or_resume_flow(self, conv_id: str, intent: str):
-            """Ensure a flow state exists and is the active one"""
-            st = self.user_states.get(conv_id)
-            if not st or st.get("flow") != intent:
-                self.user_states[conv_id] = {"flow": intent, "step": 0, "data": {}, "started_at": time.time()}
-        
-        def is_flow_active(self, conv_id: str) -> bool:
-            """Check if a flow is active for this conversation"""
-            return conv_id in self.user_states
-        
-        def active_flow(self, conv_id: str) -> Union[str, None]:
-            """Get the active flow for this conversation"""
-            return self.user_states.get(conv_id, {}).get("flow")
-        
-        def handle_flow_turn(self, conv_id: str, user_text: str, entities: dict) -> str:
-            """Advance current flow by filling the next required slot, or finalize"""
-            state = self.user_states.get(conv_id)
-            if not state:
-                return "Internal error: no active flow."
-            
-            flow_name = state["flow"]
-            cfg = self.flows[flow_name]
-            step = state["step"]
-            slots = cfg["required_slots"]
-            
-            # If all slots filled, finalize and clear
-            if step >= len(slots):
-                msg = cfg["finalize"](state["data"])
-                self.user_states.pop(conv_id, None)
-                return msg
-            
-            required = slots[step]["key"]
-            ask_msg = slots[step]["ask"]
-            
-            # 1) If entity extractor already found it
-            if required in entities:
-                state["data"][required] = entities[required]
-                state["step"] += 1
-                self.user_states[conv_id] = state
-                return self.handle_flow_turn(conv_id, user_text, entities)  # recurse to move to next step or finalize
-            
-            # 2) Heuristics from user text (simple)
-            txt = user_text.lower().strip()
-            
-            if required == "resolution":
-                if "refund" in txt:
-                    state["data"]["resolution"] = "refund"
-                    state["step"] += 1
-                    self.user_states[conv_id] = state
-                    return self.handle_flow_turn(conv_id, user_text, entities)
-                if "replace" in txt or "replacement" in txt or "exchange" in txt:
-                    state["data"]["resolution"] = "replacement"
-                    state["step"] += 1
-                    self.user_states[conv_id] = state
-                    return self.handle_flow_turn(conv_id, user_text, entities)
-            
-            if required == "reason":
-                # Map common reasons quickly
-                reason_map = {
-                    "damaged": "damaged",
-                    "defect": "damaged",
-                    "wrong": "wrong item",
-                    "size": "size issue",
-                    "fit": "size issue",
-                    "changed": "changed mind",
-                    "other": "other"
-                }
-                for k, v in reason_map.items():
-                    if k in txt:
-                        state["data"]["reason"] = v
-                        state["step"] += 1
-                        self.user_states[conv_id] = state
-                        return self.handle_flow_turn(conv_id, user_text, entities)
-                
-                # Otherwise treat full text as reason if it sounds like one
-                if len(txt) >= 3:
-                    state["data"]["reason"] = user_text.strip()
-                    state["step"] += 1
-                    self.user_states[conv_id] = state
-                    return self.handle_flow_turn(conv_id, user_text, entities)
-            
-            # If we got here, we still need that slot → ask for it
-            self.user_states[conv_id] = state
-            if callable(ask_msg):
-                return ask_msg(state["data"])
-            else:
-                return ask_msg
         
         # Active conversation state tracking (keeping for backward compatibility)
         self.active_conversations = {}  # conversation_id -> conversation_state
@@ -339,6 +238,249 @@ class RAGChatbot:
         }
         
         self.initialize_system()
+    
+    # Helper method for generating ticket IDs
+    def make_ticket_id(self):
+        return f"TKT-{uuid.uuid4().hex[:8].upper()}"
+    
+    # DST Flow Engine Methods
+    def normalize_intent(self, raw_text: str) -> Union[str, None]:
+        """Normalize intent with typo handling using difflib"""
+        t = raw_text.lower().strip()
+        
+        # Quick patches for common typos
+        quick_map = {"redund": "refund", "refnd": "refund", "reund": "refund", "shippng": "shipping", "delivry": "delivery"}
+        for k, v in quick_map.items():
+            if k in t:
+                t = t.replace(k, v)
+        
+        # Try exact hit first
+        for intent, vocab in self.intent_canonical.items():
+            if any(word in t for word in vocab):
+                return intent
+        
+        # Fuzzy: best approximate across all canonical words
+        best_score, best_intent = 0.0, None
+        for intent, vocab in self.intent_canonical.items():
+            for word in vocab:
+                s = SequenceMatcher(None, t, word).ratio()
+                if s > best_score:
+                    best_score, best_intent = s, intent
+        
+        return best_intent if best_score >= 0.65 else None
+    
+    def _is_flow_active(self, conv_id: str) -> bool:
+        """Check if a flow is active for this conversation"""
+        return conv_id in self.user_states
+    
+    def _active_flow(self, conv_id: str) -> Union[str, None]:
+        """Get the active flow for this conversation"""
+        return self.user_states.get(conv_id, {}).get("flow")
+    
+    def _start_or_resume_flow(self, conv_id: str, intent: str, entities: Dict) -> str:
+        """Start or resume a flow, attempt to fill slots from provided entities"""
+        # Ensure flow state exists
+        if conv_id not in self.user_states or self.user_states[conv_id].get("flow") != intent:
+            self.user_states[conv_id] = {"flow": intent, "step": 0, "data": {}, "started_at": time.time()}
+        
+        # Try to fill slots from provided entities
+        state = self.user_states[conv_id]
+        flow_config = self.flows[intent]
+        current_step = state["step"]
+        
+        if current_step >= len(flow_config["required_slots"]):
+            # All slots filled, finalize
+            msg = flow_config["finalize"](state["data"])
+            self.user_states.pop(conv_id, None)
+            return msg
+        
+        # Check if current required slot can be filled from entities
+        required_slot = flow_config["required_slots"][current_step]["key"]
+        if required_slot in entities:
+            state["data"][required_slot] = entities[required_slot]
+            state["step"] += 1
+            # Recursively check if we can fill more slots
+            return self._start_or_resume_flow(conv_id, intent, entities)
+        
+        # Return the question for the current required slot
+        ask_msg = flow_config["required_slots"][current_step]["ask"]
+        if callable(ask_msg):
+            return ask_msg(state["data"])
+        else:
+            return ask_msg
+    
+    def _handle_flow_turn(self, conv_id: str, query: str, entities: Dict) -> str:
+        """Process a turn within an active flow, extract entities to fill next required slot"""
+        state = self.user_states.get(conv_id)
+        if not state:
+            return "Internal error: no active flow."
+        
+        flow_name = state["flow"]
+        flow_config = self.flows[flow_name]
+        current_step = state["step"]
+        
+        if current_step >= len(flow_config["required_slots"]):
+            # All slots filled, finalize
+            msg = flow_config["finalize"](state["data"])
+            self.user_states.pop(conv_id, None)
+            return msg
+        
+        required_slot = flow_config["required_slots"][current_step]["key"]
+        ask_msg = flow_config["required_slots"][current_step]["ask"]
+        
+        # Try to fill slot from entities
+        if required_slot in entities:
+            state["data"][required_slot] = entities[required_slot]
+            state["step"] += 1
+            # Recursively check if we can fill more slots
+            return self._handle_flow_turn(conv_id, query, entities)
+        
+        # Try to extract slot from user text using heuristics
+        query_lower = query.lower().strip()
+        
+        if required_slot == "resolution":
+            if "refund" in query_lower:
+                state["data"]["resolution"] = "refund"
+                state["step"] += 1
+                return self._handle_flow_turn(conv_id, query, entities)
+            elif any(word in query_lower for word in ["replace", "replacement", "exchange"]):
+                state["data"]["resolution"] = "replacement"
+                state["step"] += 1
+                return self._handle_flow_turn(conv_id, query, entities)
+        
+        elif required_slot == "reason":
+            # Map common reasons
+            reason_map = {
+                "damaged": "damaged", "defect": "damaged", "broken": "damaged",
+                "wrong": "wrong item", "incorrect": "wrong item",
+                "size": "size issue", "fit": "size issue",
+                "changed": "changed mind", "mind": "changed mind",
+                "other": "other"
+            }
+            for keyword, reason in reason_map.items():
+                if keyword in query_lower:
+                    state["data"]["reason"] = reason
+                    state["step"] += 1
+                    return self._handle_flow_turn(conv_id, query, entities)
+            
+            # If no specific reason found, treat the whole text as reason
+            if len(query_lower) >= 3:
+                state["data"]["reason"] = query.strip()
+                state["step"] += 1
+                return self._handle_flow_turn(conv_id, query, entities)
+        
+        # If we got here, we still need that slot → ask for it
+        if callable(ask_msg):
+            return ask_msg(state["data"])
+        else:
+            return ask_msg
+    
+    def _reset_flow(self, conv_id: str):
+        """Clear the state for a specific conversation ID"""
+        self.user_states.pop(conv_id, None)
+    
+    # DST Finalization Methods
+    def _finalize_return_flow_dst(self, data: Dict) -> str:
+        """Finalize return flow and create support ticket"""
+        ticket_id = self.make_ticket_id()
+        order_id = data.get("order_id", "your order")
+        reason = data.get("reason", "your return reason")
+        resolution = data.get("resolution", "your preference")
+        
+        return f"""🎫 **Return Request Completed!**
+
+✅ **Support Ticket Created**
+Ticket ID: {ticket_id}
+
+📋 **Return Details:**
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: {resolution}
+
+📧 **Next Steps:**
+Our returns team will process your request within 24-48 hours. You'll receive an email confirmation with return shipping instructions.
+
+Thank you for your patience!"""
+    
+    def _finalize_shipping_flow_dst(self, data: Dict) -> str:
+        """Finalize shipping flow and create support ticket"""
+        ticket_id = self.make_ticket_id()
+        order_id = data.get("order_id", "your order")
+        shipping_issue = data.get("shipping_issue", "your shipping concern")
+        
+        return f"""🎫 **Shipping Support Ticket Created!**
+
+✅ **Support Ticket Created**
+Ticket ID: {ticket_id}
+
+📋 **Shipping Details:**
+- Order ID: {order_id}
+- Issue: {shipping_issue}
+
+📧 **Next Steps:**
+Our shipping team will investigate and get back to you within 2-4 hours with tracking updates or resolution.
+
+Thank you for your patience!"""
+    
+    def _finalize_billing_flow_dst(self, data: Dict) -> str:
+        """Finalize billing flow and create support ticket"""
+        ticket_id = self.make_ticket_id()
+        order_id = data.get("order_id", "your order")
+        billing_issue = data.get("billing_issue", "your billing concern")
+        
+        return f"""🎫 **Billing Support Ticket Created!**
+
+✅ **Support Ticket Created**
+Ticket ID: {ticket_id}
+
+📋 **Billing Details:**
+- Order ID: {order_id}
+- Issue: {billing_issue}
+
+📧 **Next Steps:**
+Our billing team will investigate and resolve this within 24-48 hours. You'll receive an email confirmation.
+
+Thank you for your patience!"""
+    
+    def _finalize_technical_flow_dst(self, data: Dict) -> str:
+        """Finalize technical support flow and create support ticket"""
+        ticket_id = self.make_ticket_id()
+        issue_description = data.get("issue_description", "your technical issue")
+        device_info = data.get("device_info", "your device information")
+        
+        return f"""🎫 **Technical Support Ticket Created!**
+
+✅ **Support Ticket Created**
+Ticket ID: {ticket_id}
+
+📋 **Technical Details:**
+- Issue: {issue_description}
+- Device: {device_info}
+
+📧 **Next Steps:**
+Our technical team will review your issue and get back to you within 4-6 hours with troubleshooting steps or escalation.
+
+Thank you for your patience!"""
+    
+    def _finalize_account_flow_dst(self, data: Dict) -> str:
+        """Finalize account support flow and create support ticket"""
+        ticket_id = self.make_ticket_id()
+        email = data.get("email", "your account")
+        account_issue = data.get("account_issue", "your account concern")
+        
+        return f"""🎫 **Account Support Ticket Created!**
+
+✅ **Support Ticket Created**
+Ticket ID: {ticket_id}
+
+📋 **Account Details:**
+- Email: {email}
+- Issue: {account_issue}
+
+📧 **Next Steps:**
+Our account team will assist you within 2-4 hours. You'll receive an email with instructions or resolution.
+
+Thank you for your patience!"""
     
     def initialize_system(self):
         """Initialize the RAG system"""
@@ -768,20 +910,18 @@ class RAGChatbot:
 How can I assist you today?"""
             
             # DST FLOW ENGINE: Check if a flow is already active
-            if conversation_id and self.is_flow_active(conversation_id):
+            if conversation_id and self._is_flow_active(conversation_id):
                 # Continue the active flow - NO reclassification
-                return self.handle_flow_turn(conversation_id, query, entities)
+                return self._handle_flow_turn(conversation_id, query, entities)
             
             # If no active flow, try to start one based on intent
             if intent in self.flows:
-                self.start_or_resume_flow(conversation_id, intent)
-                return self.handle_flow_turn(conversation_id, query, entities)
+                return self._start_or_resume_flow(conversation_id, intent, entities)
             
             # If intent not in flows, try to normalize it
             normalized_intent = self.normalize_intent(query)
             if normalized_intent and normalized_intent in self.flows:
-                self.start_or_resume_flow(conversation_id, normalized_intent)
-                return self.handle_flow_turn(conversation_id, query, entities)
+                return self._start_or_resume_flow(conversation_id, normalized_intent, entities)
             
             # Fallback to RAG/KB answer if no flow matches
             if context and len(context) > 0:
