@@ -518,7 +518,7 @@ class RAGChatbot:
             logger.error(f"Error searching knowledge base: {e}")
             return []
     
-    def generate_response(self, query: str, context: List[Dict], intent: str, entities: Dict, conversation_context: List[Dict] = None) -> str:
+    def generate_response(self, query: str, context: List[Dict], intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> str:
         """Generate response using decision tree flow to avoid infinite loops"""
         try:
             # Handle greetings first
@@ -1533,7 +1533,7 @@ Would you like me to create a support ticket so our team can help you directly?"
                 logger.info("No relevant chunks found in knowledge base")
             
             # Generate response with conversation context
-            response = self.generate_response(query, relevant_chunks, intent, entities, conversation_context)
+            response = self.generate_response(query, relevant_chunks, intent, entities, conversation_context, conversation_id)
             
             # Determine if ticket creation is needed (check state first)
             ticket_id = None
