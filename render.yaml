@@ -11,3 +11,8 @@ services:
         value: production
       - key: FLASK_DEBUG
         value: false
+    buildFilter:
+      paths:
+        - "requirements.txt"
+        - "pyproject.toml"
+        - "runtime.txt"
