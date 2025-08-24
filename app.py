@@ -20,7 +20,7 @@ from config import Config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', static_url_path='/static')
 CORS(app)
 
 class RAGChatbot:
@@ -281,6 +281,11 @@ class RAGChatbot:
         """Extract entities from text using regex patterns with conversation context and state"""
         entities = {}
         
+        # Skip entity extraction for obvious greetings (performance optimization)
+        text_lower = text.lower().strip()
+        if text_lower in ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening']:
+            return entities
+        
         # Extract entities from current text ONLY
         for entity_type, pattern in self.entity_patterns.items():
             matches = re.findall(pattern, text, re.IGNORECASE)
@@ -382,8 +387,15 @@ class RAGChatbot:
     def search_knowledge_base(self, query: str, top_k: int = 3, conversation_context: List[Dict] = None) -> List[Dict]:
         """Search knowledge base using vector similarity with conversation context"""
         try:
+            # Memory safety check
             if self.vector_index is None or self.knowledge_base is None or len(self.knowledge_base) == 0:
+                logger.warning("Knowledge base not initialized - returning empty results")
                 return []
+            
+            # Limit query length to prevent memory issues
+            if len(query) > 1000:
+                query = query[:1000]
+                logger.warning("Query truncated to prevent memory issues")
             
             # Enhance query with conversation context if available
             enhanced_query = query
@@ -1163,8 +1175,23 @@ Would you like me to create a support ticket so our team can help you directly?"
                 }
             }
 
-# Initialize the RAG chatbot
-rag_bot = RAGChatbot()
+# Initialize the RAG chatbot globally (reused across requests)
+rag_bot = None
+
+def get_rag_bot():
+    """Get or create RAG chatbot instance (singleton pattern)"""
+    global rag_bot
+    if rag_bot is None:
+        try:
+            rag_bot = RAGChatbot()
+            logger.info("RAG chatbot initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG chatbot: {e}")
+            # Create a minimal fallback instance
+            rag_bot = RAGChatbot()
+            rag_bot.knowledge_base = []
+            rag_bot.vector_index = None
+    return rag_bot
 
 # Web Routes
 @app.route('/')
@@ -1177,13 +1204,14 @@ def index():
 def health_check():
     """Health check endpoint"""
     try:
+        bot = get_rag_bot()
         system_status = {
             'status': 'healthy',
-            'system_initialized': rag_bot.vector_index is not None,
-            'knowledge_base_size': len(rag_bot.knowledge_base),
+            'system_initialized': bot.vector_index is not None,
+            'knowledge_base_size': len(bot.knowledge_base),
             'apis_configured': {
-                'cohere': bool(rag_bot.cohere_api_key),
-                'groq': bool(rag_bot.groq_api_key)
+                'cohere': bool(bot.cohere_api_key),
+                'groq': bool(bot.groq_api_key)
             }
         }
         return jsonify(system_status)
@@ -1201,8 +1229,11 @@ def chat():
         if not message.strip():
             return jsonify({'error': 'Message cannot be empty'}), 400
         
+        # Get RAG bot instance
+        bot = get_rag_bot()
+        
         # Process the query
-        result = rag_bot.process_query(message, conversation_id)
+        result = bot.process_query(message, conversation_id)
         
         return jsonify(result)
         
@@ -1214,7 +1245,8 @@ def chat():
 def analytics():
     """Analytics endpoint"""
     try:
-        return jsonify(dict(rag_bot.analytics))
+        bot = get_rag_bot()
+        return jsonify(dict(bot.analytics))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1222,11 +1254,12 @@ def analytics():
 def knowledge_base_info():
     """Get knowledge base information"""
     try:
+        bot = get_rag_bot()
         return jsonify({
-            'total_chunks': len(rag_bot.knowledge_base),
-            'sources': list(set(chunk['source'] for chunk in rag_bot.knowledge_base)),
-            'embedding_dimension': rag_bot.embeddings.shape[1] if rag_bot.embeddings is not None else 0,
-            'vector_index_size': len(rag_bot.vector_index) if rag_bot.vector_index is not None else 0
+            'total_chunks': len(bot.knowledge_base),
+            'sources': list(set(chunk['source'] for chunk in bot.knowledge_base)),
+            'embedding_dimension': bot.embeddings.shape[1] if bot.embeddings is not None else 0,
+            'vector_index_size': len(bot.vector_index) if bot.vector_index is not None else 0
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1241,7 +1274,8 @@ def test_search():
         if not query:
             return jsonify({'error': 'Query cannot be empty'}), 400
         
-        results = rag_bot.search_knowledge_base(query, top_k=5)
+        bot = get_rag_bot()
+        results = bot.search_knowledge_base(query, top_k=5)
         
         return jsonify({
             'query': query,
@@ -1260,14 +1294,15 @@ def clear_chat():
         conversation_id = data.get('conversation_id', '')
         
         if conversation_id:
+            bot = get_rag_bot()
             # Clear conversation history
-            if conversation_id in rag_bot.conversation_history:
-                del rag_bot.conversation_history[conversation_id]
+            if conversation_id in bot.conversation_history:
+                del bot.conversation_history[conversation_id]
                 logger.info(f"Cleared conversation history for {conversation_id}")
             
             # Clear conversation state
-            if conversation_id in rag_bot.conversation_state:
-                del rag_bot.conversation_state[conversation_id]
+            if conversation_id in bot.conversation_state:
+                del bot.conversation_state[conversation_id]
                 logger.info(f"Cleared conversation state for {conversation_id}")
         
         return jsonify({'status': 'success', 'message': 'Chat cleared successfully'})
