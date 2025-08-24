@@ -30,8 +30,21 @@ class RAGChatbot:
         self.groq_api_key = Config.GROQ_API_KEY
         
         # Initialize clients
-        self.cohere_client = cohere.Client(self.cohere_api_key)
-        self.groq_client = Groq(api_key=self.groq_api_key)
+        self.cohere_client = None
+        self.groq_client = None
+        
+        # Initialize clients only if API keys are available
+        if self.cohere_api_key and self.cohere_api_key != 'your_cohere_api_key_here':
+            try:
+                self.cohere_client = cohere.Client(self.cohere_api_key)
+            except Exception as e:
+                logger.warning(f"Failed to initialize Cohere client: {e}")
+        
+        if self.groq_api_key and self.groq_api_key != 'your_groq_api_key_here':
+            try:
+                self.groq_client = Groq(api_key=self.groq_api_key)
+            except Exception as e:
+                logger.warning(f"Failed to initialize Groq client: {e}")
         
         # System state
         self.knowledge_base = []
@@ -85,8 +98,11 @@ class RAGChatbot:
             
             # Create embeddings and vector index
             if self.knowledge_base:
-                self.create_embeddings()
-                logger.info("RAG system initialized successfully")
+                if self.cohere_client:
+                    self.create_embeddings()
+                    logger.info("RAG system initialized successfully")
+                else:
+                    logger.warning("Cohere client not available - RAG system will not function properly")
             else:
                 logger.warning("No knowledge base loaded - creating sample data")
                 self.create_sample_knowledge_base()
@@ -226,6 +242,10 @@ class RAGChatbot:
             texts = [chunk['content'] for chunk in self.knowledge_base]
             
             # Create embeddings using Cohere
+            if not self.cohere_client:
+                logger.error("Cohere client not available - cannot create embeddings")
+                return
+                
             response = self.cohere_client.embed(
                 texts=texts,
                 model='embed-english-v3.0',
@@ -350,6 +370,10 @@ class RAGChatbot:
                 logger.info(f"Enhanced query with context: {enhanced_query}")
             
             # Create query embedding
+            if not self.cohere_client:
+                logger.error("Cohere client not available - cannot create query embeddings")
+                return []
+                
             response = self.cohere_client.embed(
                 texts=[enhanced_query],
                 model='embed-english-v3.0',
@@ -494,6 +518,9 @@ Would you like me to create a support ticket so our team can help you directly?"
             """
             
             # Generate response using Groq
+            if not self.groq_client:
+                return "I apologize, but I'm currently unable to generate responses. Please check your API configuration."
+            
             response = self.groq_client.chat.completions.create(
                 model="llama3-8b-8192",
                 messages=[
@@ -947,7 +974,18 @@ if __name__ == '__main__':
     print("\n🌐 Server starting on http://localhost:5000")
     print("🎨 Beautiful web interface available")
     print(f"\n📂 Place your PDF knowledge base files in the '{Config.UPLOAD_FOLDER}/' folder")
-    print("🔑 API keys are configured and ready")
+    
+    # Show client status
+    if rag_bot.cohere_client:
+        print("✅ Cohere client: Ready")
+    else:
+        print("❌ Cohere client: Not configured (check COHERE_API_KEY)")
+    
+    if rag_bot.groq_client:
+        print("✅ Groq client: Ready")
+    else:
+        print("❌ Groq client: Not configured (check GROQ_API_KEY)")
+    
     print("\n💡 Chatbot will only use Groq API when relevant content is found!")
     
     app.run(debug=Config.DEBUG, host=Config.HOST, port=Config.PORT)
