@@ -76,7 +76,7 @@ class RAGChatbot:
         # Entity patterns
         self.entity_patterns = {
             'email': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-            'order_id': r'\b[A-Z]{2,3}-\d{3,6}\b|\b\d{4,8}\b',  # Also match simple numeric IDs
+            'order_id': r'\b[A-Z]{2,3}-\d{3,6}\b|\b\d{3,8}\b',  # Also match simple numeric IDs (3-8 digits)
             'phone': r'\b\d{3}-\d{3}-\d{4}\b|\b\(\d{3}\)\s*\d{3}-\d{4}\b',
             'amount': r'\$\d+(?:\.\d{2})?',
             'date': r'\b\d{1,2}\/\d{1,2}\/\d{2,4}\b|\b\d{1,2}-\d{1,2}-\d{2,4}\b',
@@ -277,10 +277,14 @@ class RAGChatbot:
             matches = re.findall(pattern, text, re.IGNORECASE)
             if matches:
                 entities[entity_type] = matches[0] if len(matches) == 1 else matches
+                logger.info(f"Extracted {entity_type} entity: {entities[entity_type]}")
+            else:
+                logger.info(f"No {entity_type} entity found in text: '{text}'")
         
         # Extract product entities from text ONLY
         product_keywords = ['sunscreen', 'cream', 'soap', 'lotion', 'shampoo', 'makeup', 'cosmetic', 'aqualogica']
         text_lower = text.lower()
+        logger.info(f"Checking for product keywords in: '{text_lower}'")
         for keyword in product_keywords:
             if keyword.lower() in text_lower:
                 entities['product'] = keyword
@@ -426,6 +430,9 @@ How can I assist you today?"""
             # EARLY EXIT: If we have order_id + product, create ticket and end conversation
             # Check if we have enough info from conversation context to create a ticket
             if conversation_context and len(conversation_context) > 0:
+                # Debug: Log the full conversation context
+                logger.info(f"Full conversation context: {conversation_context}")
+                
                 # Check if we have order_id and product info from any previous messages
                 has_order_id = any('order_id' in msg.get('entities', {}) for msg in conversation_context)
                 has_product = any('product' in msg.get('entities', {}) for msg in conversation_context)
@@ -452,11 +459,19 @@ For immediate assistance with non-e-commerce matters, please contact the appropr
             
             # Check if we have relevant content from knowledge base
             if not context or len(context) == 0:
-                # Check if we're missing critical information
+                # Check if we're missing critical information from conversation context
                 missing_info = []
-                if not any('order_id' in msg.get('entities', {}) for msg in conversation_context):
+                
+                # Check if we have order_id in any previous messages
+                has_order_id = any('order_id' in msg.get('entities', {}) for msg in conversation_context)
+                logger.info(f"Checking for order_id in conversation context: {has_order_id}")
+                if not has_order_id:
                     missing_info.append("order ID")
-                if not any('product' in msg.get('entities', {}) for msg in conversation_context):
+                
+                # Check if we have product in any previous messages  
+                has_product = any('product' in msg.get('entities', {}) for msg in conversation_context)
+                logger.info(f"Checking for product in conversation context: {has_product}")
+                if not has_product:
                     missing_info.append("product name")
                 
                 if missing_info:
@@ -812,6 +827,9 @@ Would you like me to create a support ticket so our team can help you directly?"
             if conversation_id not in self.conversation_history:
                 self.conversation_history[conversation_id] = []
             
+            # Debug: Log what we're storing
+            logger.info(f"Storing conversation entry - entities: {entities}")
+            
             self.conversation_history[conversation_id].append({
                 'query': query,
                 'response': response,
@@ -821,6 +839,9 @@ Would you like me to create a support ticket so our team can help you directly?"
                 'ticket_id': ticket_id,
                 'timestamp': datetime.now().isoformat()
             })
+            
+            # Debug: Log the full conversation history
+            logger.info(f"Full conversation history for {conversation_id}: {self.conversation_history[conversation_id]}")
             
             return {
                 'response': response,
