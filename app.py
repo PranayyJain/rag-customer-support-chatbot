@@ -3,6 +3,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Any
+from difflib import SequenceMatcher
 
 import numpy as np
 from flask import Flask, request, jsonify, render_template
@@ -29,6 +30,58 @@ class RAGChatbot:
         self.cohere_api_key = Config.COHERE_API_KEY
         self.groq_api_key = Config.GROQ_API_KEY
         
+        # DST Flow Engine - Session memory for each conversation
+        self.user_states = {}  # {conv_id: {"flow": str, "step": int, "data": dict, "started_at": float}}
+        
+        # Declarative flows - single source of truth
+        self.flows = {
+            "return": {
+                "required_slots": [
+                    {"key": "order_id", "ask": "🔄 **Return Request**\n\nI'd be happy to help you with your return!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n\n**Example:** \"I want to return order 12345\"\n\nOnce you provide the order ID, I can help process your return request."},
+                    {"key": "reason", "ask": lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the reason for your return:\n\n🔍 **Why are you returning this item?**\n- Damaged or defective product\n- Wrong item received\n- Size doesn\'t fit\n- Changed your mind\n- Other reason\n\n**Example:** "The product was damaged during shipping" or "I received the wrong item"\n\nOnce you tell me the reason, I can process your return request.'},
+                    {"key": "resolution", "ask": lambda data: f'✅ **Return Details Complete**\n\nPerfect! I have all the information I need:\n- Order ID: {data.get("order_id", "your order")}\n- Reason: {data.get("reason", "your return reason")}\n\nNow I need to know your preference:\n\n🔍 **What would you like?**\n- **Refund**: Money back to your original payment method\n- **Replacement**: Same item shipped to you again\n- **Exchange**: Different item of equal value\n\n**Example:** "I want a refund" or "I\'d like a replacement"\n\nOnce you choose, I can immediately process your request and create a support ticket.'}
+                ],
+                "finalize": lambda data: self._finalize_return_flow_dst(data)
+            },
+            "shipping": {
+                "required_slots": [
+                    {"key": "order_id", "ask": "📦 **Shipping Assistance**\n\nI'd be happy to help with your shipping concern!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n- Or check your account order history\n\n**Example:** \"My order ID is 12345\" or \"Where is order 12345?\"\n\nOnce you provide the order ID, I can immediately create a support ticket and get our shipping team involved."},
+                    {"key": "shipping_issue", "ask": lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific shipping issue:\n\n🔍 **What shipping problem are you experiencing?**\n- Package not delivered\n- Delayed delivery\n- Wrong address\n- Damaged package\n- Tracking not working\n- Other shipping concern\n\n**Example:** "My package was supposed to arrive yesterday but it\'s still not here"\n\nOnce you describe the issue, I can create a support ticket for our shipping team.'}
+                ],
+                "finalize": lambda data: self._finalize_shipping_flow_dst(data)
+            },
+            "billing": {
+                "required_slots": [
+                    {"key": "order_id", "ask": "💳 **Billing Assistance**\n\nI'd be happy to help with your billing concern!\n\n🔍 **I need your order ID or transaction ID:**\n- Please provide your order number\n- Or the transaction ID from your bank statement\n- You can find this in your order confirmation email\n\n**Example:** \"I was charged twice for order 12345\"\n\nOnce you provide the order ID, I can immediately investigate and create a support ticket."},
+                    {"key": "billing_issue", "ask": lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific billing issue:\n\n🔍 **What billing problem are you experiencing?**\n- Duplicate charge\n- Incorrect amount charged\n- Payment failed\n- Refund not received\n- Subscription billing issue\n- Other billing concern\n\n**Example:** "I was charged twice for the same order" or "My payment failed during checkout"\n\nOnce you describe the issue, I can investigate and create a support ticket.'}
+                ],
+                "finalize": lambda data: self._finalize_billing_flow_dst(data)
+            },
+            "technical": {
+                "required_slots": [
+                    {"key": "issue_description", "ask": "🛠️ **Technical Support**\n\nI'd be happy to help with your technical issue!\n\n🔍 **Please describe the problem:**\n- What exactly is happening?\n- What were you trying to do?\n- What error messages do you see?\n- What device/browser are you using?\n\n**Examples:**\n- \"I can\'t log into my account\"\n- \"The app keeps crashing on my iPhone\"\n- \"I get an error when trying to checkout\"\n\nOnce you provide details, I can create a support ticket for our technical team."},
+                    {"key": "device_info", "ask": lambda data: f'✅ **Issue Description Received**\n\nGreat! I understand: {data.get("issue_description", "your technical issue")}\n\nNow I need to know your device information:\n\n🔍 **What device/browser are you using?**\n- Device type (iPhone, Android, Windows, Mac, etc.)\n- Browser (Chrome, Safari, Firefox, Edge)\n- App version (if using mobile app)\n- Operating system version\n\n**Example:** "iPhone 14 with iOS 17, using Safari"\n\nOnce you provide this, I can create a support ticket for our technical team.'}
+                ],
+                "finalize": lambda data: self._finalize_technical_flow_dst(data)
+            },
+            "account": {
+                "required_slots": [
+                    {"key": "email", "ask": "🔐 **Account Support**\n\nI'd be happy to help with your account issue!\n\n🔍 **I need your email address:**\n- Please provide the email associated with your account\n- This helps me verify your identity and access\n\n**Example:** \"I can\'t log into john@email.com\"\n\nOnce you provide your email, I can immediately assist with your account concern."},
+                    {"key": "account_issue", "ask": lambda data: f'✅ **Email Received: {data.get("email", "your account")}**\n\nGreat! Now I need to know the specific account issue:\n\n🔍 **What account problem are you experiencing?**\n- Can\'t log in\n- Forgot password\n- Account locked\n- Need to update profile\n- Two-factor authentication issue\n- Other account concern\n\n**Examples:**\n- \"I forgot my password\"\n- \"My account is locked after too many failed attempts\"\n- \"I need to update my email address\"\n\nOnce you describe the issue, I can assist you and create a support ticket if needed.'}
+                ],
+                "finalize": lambda data: self._finalize_account_flow_dst(data)
+            }
+        }
+        
+        # Intent canonical mapping with typo handling
+        self.intent_canonical = {
+            "return": {"return", "refund", "replacement", "exchange", "redund", "refnd", "reund"},
+            "shipping": {"shipping", "delivery", "track", "status", "package", "arrived", "late", "delayed"},
+            "billing": {"billing", "payment", "charge", "invoice", "bill", "money", "cost", "fee"},
+            "account": {"account", "password", "login", "signin", "sign-in", "profile", "access"},
+            "technical": {"tech", "technical", "bug", "error", "crash", "app", "not working", "broken", "issue", "problem"}
+        }
+        
         # Initialize clients
         self.cohere_client = None
         self.groq_client = None
@@ -53,10 +106,124 @@ class RAGChatbot:
         self.conversation_history = {}
         self.conversation_state = {}  # Track conversation state (order_id, product, etc.)
         
-        # Active conversation state tracking
+        # DST Flow Engine Methods
+        def normalize_intent(self, raw_text: str) -> str | None:
+            """Normalize intent with typo handling using difflib"""
+            t = raw_text.lower().strip()
+            
+            # Quick patches for common typos
+            quick_map = {"redund": "refund", "refnd": "refund", "reund": "refund", "shippng": "shipping", "delivry": "delivery"}
+            for k, v in quick_map.items():
+                if k in t:
+                    t = t.replace(k, v)
+            
+            # Try exact hit first
+            for intent, vocab in self.intent_canonical.items():
+                if any(word in t for word in vocab):
+                    return intent
+            
+            # Fuzzy: best approximate across all canonical words
+            best_score, best_intent = 0.0, None
+            for intent, vocab in self.intent_canonical.items():
+                for word in vocab:
+                    s = SequenceMatcher(None, t, word).ratio()
+                    if s > best_score:
+                        best_score, best_intent = s, intent
+            
+            return best_intent if best_score >= 0.65 else None
+        
+        def start_or_resume_flow(self, conv_id: str, intent: str):
+            """Ensure a flow state exists and is the active one"""
+            st = self.user_states.get(conv_id)
+            if not st or st.get("flow") != intent:
+                self.user_states[conv_id] = {"flow": intent, "step": 0, "data": {}, "started_at": time.time()}
+        
+        def is_flow_active(self, conv_id: str) -> bool:
+            """Check if a flow is active for this conversation"""
+            return conv_id in self.user_states
+        
+        def active_flow(self, conv_id: str) -> str | None:
+            """Get the active flow for this conversation"""
+            return self.user_states.get(conv_id, {}).get("flow")
+        
+        def handle_flow_turn(self, conv_id: str, user_text: str, entities: dict) -> str:
+            """Advance current flow by filling the next required slot, or finalize"""
+            state = self.user_states.get(conv_id)
+            if not state:
+                return "Internal error: no active flow."
+            
+            flow_name = state["flow"]
+            cfg = self.flows[flow_name]
+            step = state["step"]
+            slots = cfg["required_slots"]
+            
+            # If all slots filled, finalize and clear
+            if step >= len(slots):
+                msg = cfg["finalize"](state["data"])
+                self.user_states.pop(conv_id, None)
+                return msg
+            
+            required = slots[step]["key"]
+            ask_msg = slots[step]["ask"]
+            
+            # 1) If entity extractor already found it
+            if required in entities:
+                state["data"][required] = entities[required]
+                state["step"] += 1
+                self.user_states[conv_id] = state
+                return self.handle_flow_turn(conv_id, user_text, entities)  # recurse to move to next step or finalize
+            
+            # 2) Heuristics from user text (simple)
+            txt = user_text.lower().strip()
+            
+            if required == "resolution":
+                if "refund" in txt:
+                    state["data"]["resolution"] = "refund"
+                    state["step"] += 1
+                    self.user_states[conv_id] = state
+                    return self.handle_flow_turn(conv_id, user_text, entities)
+                if "replace" in txt or "replacement" in txt or "exchange" in txt:
+                    state["data"]["resolution"] = "replacement"
+                    state["step"] += 1
+                    self.user_states[conv_id] = state
+                    return self.handle_flow_turn(conv_id, user_text, entities)
+            
+            if required == "reason":
+                # Map common reasons quickly
+                reason_map = {
+                    "damaged": "damaged",
+                    "defect": "damaged",
+                    "wrong": "wrong item",
+                    "size": "size issue",
+                    "fit": "size issue",
+                    "changed": "changed mind",
+                    "other": "other"
+                }
+                for k, v in reason_map.items():
+                    if k in txt:
+                        state["data"]["reason"] = v
+                        state["step"] += 1
+                        self.user_states[conv_id] = state
+                        return self.handle_flow_turn(conv_id, user_text, entities)
+                
+                # Otherwise treat full text as reason if it sounds like one
+                if len(txt) >= 3:
+                    state["data"]["reason"] = user_text.strip()
+                    state["step"] += 1
+                    self.user_states[conv_id] = state
+                    return self.handle_flow_turn(conv_id, user_text, entities)
+            
+            # If we got here, we still need that slot → ask for it
+            self.user_states[conv_id] = state
+            if callable(ask_msg):
+                return ask_msg(state["data"])
+            else:
+                return ask_msg
+        
+        # Active conversation state tracking (keeping for backward compatibility)
         self.active_conversations = {}  # conversation_id -> conversation_state
         
-        # Config-driven conversation flows (declarative, not hardcoded)
+        # Config-driven conversation flows (keeping for backward compatibility)
         self.conversation_flows = {
             'return': {
                 'steps': [
@@ -544,7 +711,7 @@ class RAGChatbot:
                 return []
             
             # Ensure we have valid similarities before proceeding
-            if similarities.size == 0:
+            if similarities is None or similarities.size == 0:
                 logger.warning("No similarities calculated - empty result")
                 return []
             
@@ -558,7 +725,7 @@ class RAGChatbot:
             
             results = []
             # Ensure both arrays are 1D and have the same length
-            if len(scores) == len(indices) and len(scores) > 0:
+            if indices is not None and scores is not None and len(scores) == len(indices) and len(scores) > 0:
                 for i in range(len(scores)):
                     try:
                         # Convert numpy types to Python types safely
@@ -586,7 +753,7 @@ class RAGChatbot:
             return []
     
     def generate_response(self, query: str, context: List[Dict], intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> str:
-        """Generate response using decision tree flow to avoid infinite loops"""
+        """Generate response using DST flow engine to avoid infinite loops"""
         try:
             # Handle greetings first
             if intent == 'greeting':
@@ -600,21 +767,85 @@ class RAGChatbot:
 
 How can I assist you today?"""
             
-            # DECISION TREE: Check if we have enough info to resolve the issue
-            resolution_result = self._check_resolution_ready(intent, entities, conversation_context, conversation_id)
-            if resolution_result['can_resolve']:
-                # Check if this is a resolution choice
-                if resolution_result.get('is_resolution_choice', False):
-                    return self._handle_resolution_choice(intent, query, resolution_result['entities'], conversation_id)
-                else:
-                    return self._generate_resolution_response(intent, resolution_result, conversation_context)
+            # DST FLOW ENGINE: Check if a flow is already active
+            if conversation_id and self.is_flow_active(conversation_id):
+                # Continue the active flow - NO reclassification
+                return self.handle_flow_turn(conversation_id, query, entities)
             
-            # If we can't resolve yet, ask for missing information
-            return self._ask_for_missing_info(intent, entities, conversation_context, conversation_id)
+            # If no active flow, try to start one based on intent
+            if intent in self.flows:
+                self.start_or_resume_flow(conversation_id, intent)
+                return self.handle_flow_turn(conversation_id, query, entities)
+            
+            # If intent not in flows, try to normalize it
+            normalized_intent = self.normalize_intent(query)
+            if normalized_intent and normalized_intent in self.flows:
+                self.start_or_resume_flow(conversation_id, normalized_intent)
+                return self.handle_flow_turn(conversation_id, query, entities)
+            
+            # Fallback to RAG/KB answer if no flow matches
+            if context and len(context) > 0:
+                # Use knowledge base content
+                return self._generate_rag_response(query, context, intent, entities)
+            else:
+                # No KB content, provide guided menu
+                return """I can help you with: returns/refunds, shipping, billing, account, and tech support. 
+
+🔍 **Try one of these:**
+- "I want a refund" or "I need to return an item"
+- "Where is my order?" or "Track my package"
+- "I was charged twice" or "Payment issue"
+- "I can't log in" or "Password reset"
+- "App not working" or "Technical problem"
+
+What would you like help with today?"""
             
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _generate_rag_response(self, query: str, context: List[Dict], intent: str, entities: Dict) -> str:
+        """Generate response using RAG knowledge base content"""
+        try:
+            if not context or len(context) == 0:
+                return "I don't have specific information about that in my knowledge base. Would you like me to create a support ticket for you?"
+            
+            # Use the most relevant chunk
+            best_chunk = context[0]
+            content = best_chunk.get('content', '')
+            
+            # Generate a helpful response based on the content
+            if intent == 'shipping':
+                return f"""Based on my knowledge base, here's what I found about shipping:
+
+{content[:300]}...
+
+Would you like me to help you with a specific shipping issue? I can create a support ticket for you."""
+            
+            elif intent == 'return':
+                return f"""Based on my knowledge base, here's what I found about returns:
+
+{content[:300]}...
+
+Would you like me to help you process a return? I can guide you through the process."""
+            
+            elif intent == 'billing':
+                return f"""Based on my knowledge base, here's what I found about billing:
+
+{content[:300]}...
+
+Would you like me to help you with a specific billing issue? I can create a support ticket for you."""
+            
+            else:
+                return f"""Here's what I found in my knowledge base:
+
+{content[:300]}...
+
+Is there anything specific I can help you with regarding this information?"""
+                
+        except Exception as e:
+            logger.error(f"Error generating RAG response: {e}")
+            return "I found some relevant information but I'm having trouble processing it. Would you like me to create a support ticket for you?"
     
     def _check_resolution_ready(self, intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> Dict:
         """Check if we have enough information to resolve the issue"""
@@ -926,6 +1157,214 @@ Is there anything else I can help you with today?"""
             
         except Exception as e:
             logger.error(f"Error asking for missing info: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    # DST Flow Finalization Methods
+    def _finalize_return_flow_dst(self, data: Dict) -> str:
+        """Finalize return flow using DST engine"""
+        try:
+            order_id = data.get('order_id', 'your order')
+            reason = data.get('reason', 'your return reason')
+            resolution = data.get('resolution', 'refund')
+            
+            if 'refund' in resolution.lower():
+                return f"""✅ **Refund Request Processed Successfully!**
+
+Perfect! I've processed your refund request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Refund to original payment method
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Refund request
+- Priority: High
+- Status: Processing
+
+📋 **Next Steps:**
+- Refund will be processed within 3-5 business days
+- You'll receive email confirmation
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+💰 **Refund Timeline:**
+- Processing: 1-2 business days
+- Bank processing: 3-5 business days
+- Appears on your statement within 5-7 days
+
+Is there anything else I can help you with today?"""
+            
+            elif 'replacement' in resolution.lower():
+                return f"""✅ **Replacement Request Processed Successfully!**
+
+Perfect! I've processed your replacement request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Replacement item
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Replacement request
+- Priority: High
+- Status: Processing
+
+📦 **Next Steps:**
+- Replacement will be shipped within 24 hours
+- You'll receive new tracking number
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+🚚 **Shipping Timeline:**
+- Processing: Same day
+- Shipping: Next business day
+- Delivery: 3-5 business days
+
+Is there anything else I can help you with today?"""
+            
+            else:
+                return f"""✅ **Exchange Request Processed Successfully!**
+
+Perfect! I've processed your exchange request:
+- Order ID: {order_id}
+- Reason: {reason}
+- Resolution: Exchange for different item
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Exchange request
+- Priority: High
+- Status: Processing
+
+🔄 **Next Steps:**
+- Exchange will be processed within 24 hours
+- You'll receive new tracking number
+- Return shipping label will be sent within 2 hours
+- Our team will contact you to arrange pickup
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing return flow DST: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_shipping_flow_dst(self, data: Dict) -> str:
+        """Finalize shipping flow using DST engine"""
+        try:
+            order_id = data.get('order_id', 'your order')
+            shipping_issue = data.get('shipping_issue', 'your shipping concern')
+            
+            return f"""✅ **Shipping Issue Addressed Successfully!**
+
+Perfect! I've processed your shipping concern:
+- Order ID: {order_id}
+- Issue: {shipping_issue}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Shipping inquiry
+- Priority: Normal
+- Status: Processing
+
+📦 **Next Steps:**
+- Our shipping team will review your order within 2 hours
+- You'll receive current shipping status and tracking information
+- Any necessary actions will be communicated promptly
+- Estimated delivery updates will be provided
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing shipping flow DST: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_billing_flow_dst(self, data: Dict) -> str:
+        """Finalize billing flow using DST engine"""
+        try:
+            order_id = data.get('order_id', 'your order')
+            billing_issue = data.get('billing_issue', 'your billing concern')
+            
+            return f"""✅ **Billing Issue Addressed Successfully!**
+
+Perfect! I've processed your billing concern:
+- Order ID: {order_id}
+- Issue: {billing_issue}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Billing inquiry
+- Priority: Normal
+- Status: Processing
+
+💳 **Next Steps:**
+- Our billing team will investigate within 2 hours
+- You'll receive detailed analysis of the issue
+- Any necessary refunds will be processed promptly
+- Payment method updates will be arranged if needed
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing billing flow DST: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_technical_flow_dst(self, data: Dict) -> str:
+        """Finalize technical flow using DST engine"""
+        try:
+            issue_description = data.get('issue_description', 'your technical issue')
+            device_info = data.get('device_info', 'your device information')
+            
+            return f"""✅ **Technical Issue Logged Successfully!**
+
+Perfect! I've recorded your technical concern:
+- Issue: {issue_description}
+- Device: {device_info}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Technical support
+- Priority: Normal
+- Status: Processing
+
+🛠️ **Next Steps:**
+- Our technical team will contact you within 2 hours
+- We'll provide step-by-step troubleshooting solutions
+- If needed, we'll escalate to senior technicians
+- We'll follow up until the issue is resolved
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing technical flow DST: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _finalize_account_flow_dst(self, data: Dict) -> str:
+        """Finalize account flow using DST engine"""
+        try:
+            email = data.get('email', 'your account')
+            account_issue = data.get('account_issue', 'your account concern')
+            
+            return f"""✅ **Account Issue Addressed Successfully!**
+
+Perfect! I've processed your account concern:
+- Email: {email}
+- Issue: {account_issue}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Account support
+- Priority: Normal
+- Status: Processing
+
+🔐 **Next Steps:**
+- Our account team will contact you within 2 hours
+- We'll verify your identity and resolve the issue
+- Any necessary instructions will be provided
+- We'll ensure secure access to your account
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error finalizing account flow DST: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
     
     def _finalize_return_flow(self, data: Dict) -> str:
