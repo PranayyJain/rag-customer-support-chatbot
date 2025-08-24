@@ -64,11 +64,11 @@ class RAGChatbot:
         # Intent patterns
         self.intent_patterns = {
             'greeting': ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'morning', 'afternoon', 'evening'],
-            'billing': ['bill', 'charge', 'payment', 'invoice', 'refund', 'money', 'cost', 'fee'],
+            'billing': ['bill', 'charge', 'payment', 'invoice', 'money', 'cost', 'fee'],
             'technical': ['bug', 'error', 'crash', 'not working', 'broken', 'issue', 'problem'],
             'account': ['login', 'password', 'account', 'profile', 'sign in', 'access'],
             'shipping': ['shipping', 'delivery', 'tracking', 'package', 'arrived', 'late', 'delayed'],
-            'return': ['return', 'exchange', 'cancel', 'refund', 'send back', 'want to return', 'need to return', 'return an order'],
+            'return': ['return', 'exchange', 'cancel', 'refund', 'send back', 'want to return', 'need to return', 'return an order', 'need refund', 'want refund'],
             'complaint': ['complaint', 'unhappy', 'disappointed', 'terrible', 'awful', 'bad'],
             'off_topic': ['sandwich', 'recipe', 'cooking', 'food', 'weather', 'sports', 'politics']
         }
@@ -455,6 +455,23 @@ How can I assist you today?"""
 I've created a support ticket for you, and our team will contact you within 2 hours to arrange the return process. This ensures we handle your return request correctly and efficiently.
 
 Thank you for contacting us. Is there anything else I can help you with today?"""
+                
+                # If we have order_id but no product, ask for product info
+                elif has_order_id and not has_product:
+                    order_id = None
+                    for msg in conversation_context:
+                        if 'order_id' in msg.get('entities', {}):
+                            order_id = msg['entities']['order_id']
+                            break
+                    
+                    return f"""Great! I have your order ID: {order_id}. Now I just need:
+
+🔍 **Product Information:**
+- Product name/item description
+- Reason for return
+- Whether the item is defective or just unwanted
+
+Once you provide the product details, I can process your return request immediately."""
             
             # Check if query is e-commerce related
             if not self.is_ecommerce_related(query, conversation_context):
@@ -597,14 +614,28 @@ For immediate assistance with non-e-commerce matters, please contact the appropr
     def _get_intent_specific_response(self, intent: str, query: str, conversation_context: List[Dict] = None) -> str:
         """Generate intent-specific responses when no knowledge base content is found"""
         try:
+            # Check conversation context for existing entities
+            existing_entities = {}
+            if conversation_context and len(conversation_context) > 0:
+                for msg in conversation_context:
+                    if msg.get('entities'):
+                        for key, value in msg['entities'].items():
+                            if key not in existing_entities:
+                                existing_entities[key] = value
+            
             if intent == 'billing':
-                return """I understand you have a billing question. While I don't have specific information about your account in my knowledge base, I can help you with general billing information:
+                # Check if we already have order_id from context
+                order_info = ""
+                if 'order_id' in existing_entities:
+                    order_info = f"\n✅ **Order ID**: {existing_entities['order_id']} (already provided)"
+                
+                return f"""I understand you have a billing question. While I don't have specific information about your account in my knowledge base, I can help you with general billing information:
 
 💳 **General Billing Information:**
 - Charges are typically processed within 24-48 hours of purchase
 - Refunds take 3-5 business days to appear on your statement
 - We accept all major credit cards and PayPal
-- Monthly subscriptions are charged on the same date each month
+- Monthly subscriptions are charged on the same date each month{order_info}
 
 🔍 **To help you better, I need:**
 - Your order ID or account email
@@ -667,13 +698,18 @@ Would you like me to create a support ticket so our technical team can assist yo
 Would you like me to create a support ticket so our shipping team can assist you directly?"""
             
             elif intent == 'return':
-                return """I understand you want to return an item. To process your return request, I need:
+                # Check if we already have order_id from context
+                order_info = ""
+                if 'order_id' in existing_entities:
+                    order_info = f"\n✅ **Order ID**: {existing_entities['order_id']} (already provided)"
+                
+                return f"""I understand you want to return an item. To process your return request, I need:
 
 🔄 **Return Requirements:**
 - Items can be returned within 30 days of purchase
 - Original packaging is required
 - Return shipping is free for defective items
-- Refunds issued to original payment method
+- Refunds issued to original payment method{order_info}
 
 🔍 **To help you better, I need:**
 - Your order ID
@@ -681,7 +717,7 @@ Would you like me to create a support ticket so our shipping team can assist you
 - Reason for return
 - Whether the item is defective or just unwanted
 
-Please provide these details so I can assist you with the return process."""
+Please provide the product details so I can assist you with the return process."""
             
             elif intent == 'complaint':
                 return """I understand you have a complaint and I want to help resolve this for you. 
