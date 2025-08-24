@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Customer Support Chatbot</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="chat-container">
+        <!-- Header -->
+        <div class="chat-header">
+            <div class="header-content">
+                <div class="bot-info">
+                    <div class="bot-avatar">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="bot-details">
+                        <h2>Customer Support AI</h2>
+                        <span class="status online">Online</span>
+                    </div>
+                </div>
+                <div class="header-actions">
+                    <button class="btn-secondary" onclick="clearChat()">
+                        <i class="fas fa-trash"></i> Clear Chat
+                    </button>
+                    <button class="btn-secondary" onclick="showAnalytics()">
+                        <i class="fas fa-chart-bar"></i> Analytics
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chat Messages Area -->
+        <div class="chat-messages" id="chatMessages">
+            <!-- Welcome Message -->
+            <div class="message bot-message">
+                <div class="message-avatar">
+                    <i class="fas fa-robot"></i>
+                </div>
+                <div class="message-content">
+                    <div class="message-text">
+                        👋 Hello! I'm your AI customer support assistant. I can help you with:
+                        <ul>
+                            <li>🔐 Account and password issues</li>
+                            <li>💳 Billing and payment questions</li>
+                            <li>🛠️ Technical support</li>
+                            <li>📦 Shipping and delivery</li>
+                            <li>🔄 Returns and refunds</li>
+                        </ul>
+                        How can I assist you today?
+                    </div>
+                    <div class="message-time">Just now</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Input Area -->
+        <div class="chat-input">
+            <div class="input-container">
+                <input type="text" id="messageInput" placeholder="Type your message here..." maxlength="500">
+                <button class="send-btn" onclick="sendMessage()" id="sendBtn">
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+            <div class="input-footer">
+                <span class="char-count" id="charCount">0/500</span>
+                <span class="typing-indicator" id="typingIndicator" style="display: none;">
+                    <i class="fas fa-circle"></i>
+                    <i class="fas fa-circle"></i>
+                    <i class="fas fa-circle"></i>
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Analytics Modal -->
+    <div class="modal" id="analyticsModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>📊 Chat Analytics</h3>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="analytics-grid">
+                    <div class="stat-card">
+                        <div class="stat-number" id="totalQueries">-</div>
+                        <div class="stat-label">Total Queries</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="totalTickets">-</div>
+                        <div class="stat-label">Tickets Created</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="avgResponseTime">-</div>
+                        <div class="stat-label">Avg Response Time</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="entityExtractionRate">-</div>
+                        <div class="stat-label">Entity Extraction Rate</div>
+                    </div>
+                </div>
+                <div class="intent-distribution">
+                    <h4>Intent Distribution</h4>
+                    <div id="intentChart"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-spinner">
+            <i class="fas fa-cog fa-spin"></i>
+            <p>Processing your request...</p>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
