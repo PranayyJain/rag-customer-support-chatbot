@@ -113,10 +113,19 @@ class RAGChatbot:
     def load_knowledge_base(self):
         """Load PDF knowledge base"""
         try:
-            pdf_files = [f for f in os.listdir(Config.UPLOAD_FOLDER) if f.endswith('.pdf')]
+            # Debug: Log the upload folder path
+            logger.info(f"Looking for PDF files in: {os.path.abspath(Config.UPLOAD_FOLDER)}")
+            
+            # Debug: List ALL files in the directory
+            all_files = os.listdir(Config.UPLOAD_FOLDER)
+            logger.info(f"All files in directory: {all_files}")
+            
+            pdf_files = [f for f in all_files if f.endswith('.pdf')]
+            logger.info(f"PDF files found: {pdf_files}")
             
             if not pdf_files:
                 logger.warning(f"No PDF files found in {Config.UPLOAD_FOLDER}/ directory")
+                logger.warning(f"Directory contents: {all_files}")
                 return
             
             for pdf_file in pdf_files:
@@ -395,6 +404,11 @@ class RAGChatbot:
             indices = np.argsort(similarities)[::-1][:top_k]  # Top k results
             scores = similarities[indices]
             
+            # Debug: Log the arrays
+            logger.info(f"Similarities shape: {similarities.shape}, type: {type(similarities)}")
+            logger.info(f"Indices shape: {indices.shape}, type: {type(indices)}")
+            logger.info(f"Scores shape: {scores.shape}, type: {type(scores)}")
+            
             results = []
             # Ensure both arrays are 1D and have the same length
             if len(scores) == len(indices):
@@ -405,6 +419,8 @@ class RAGChatbot:
                         result = self.knowledge_base[idx].copy()
                         result['similarity_score'] = score
                         results.append(result)
+            else:
+                logger.error(f"Array length mismatch: scores={len(scores)}, indices={len(indices)}")
             
             return results
             
