@@ -10,7 +10,7 @@ from flask_cors import CORS
 import cohere
 from groq import Groq
 import PyPDF2
-import faiss
+
 import re
 from collections import defaultdict
 import logging
@@ -36,7 +36,7 @@ class RAGChatbot:
         # System state
         self.knowledge_base = []
         self.embeddings = None
-        self.faiss_index = None
+        self.vector_index = None
         self.conversation_history = {}
         self.conversation_state = {}  # Track conversation state (order_id, product, etc.)
         self.analytics = {
@@ -83,7 +83,7 @@ class RAGChatbot:
             # Load knowledge base
             self.load_knowledge_base()
             
-            # Create embeddings and FAISS index
+            # Create embeddings and vector index
             if self.knowledge_base:
                 self.create_embeddings()
                 logger.info("RAG system initialized successfully")
@@ -235,15 +235,15 @@ class RAGChatbot:
             # Convert to numpy array
             self.embeddings = np.array(response.embeddings, dtype=np.float32)
             
-            # Create FAISS index
+            # Create simple vector index using numpy
             dimension = self.embeddings.shape[1]
-            self.faiss_index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+            self.vector_index = self.embeddings.copy()
             
             # Normalize embeddings for cosine similarity
-            faiss.normalize_L2(self.embeddings)
-            self.faiss_index.add(self.embeddings)
+            norms = np.linalg.norm(self.vector_index, axis=1, keepdims=True)
+            self.vector_index = self.vector_index / norms
             
-            logger.info(f"Created FAISS index with {len(self.embeddings)} embeddings (dimension: {dimension})")
+            logger.info(f"Created vector index with {len(self.embeddings)} embeddings (dimension: {dimension})")
             
         except Exception as e:
             logger.error(f"Error creating embeddings: {e}")
@@ -331,7 +331,7 @@ class RAGChatbot:
     def search_knowledge_base(self, query: str, top_k: int = 3, conversation_context: List[Dict] = None) -> List[Dict]:
         """Search knowledge base using vector similarity with conversation context"""
         try:
-            if not self.faiss_index or not self.knowledge_base:
+            if not self.vector_index or not self.knowledge_base:
                 return []
             
             # Enhance query with conversation context if available
@@ -357,10 +357,15 @@ class RAGChatbot:
             )
             
             query_embedding = np.array(response.embeddings, dtype=np.float32)
-            faiss.normalize_L2(query_embedding)
             
-            # Search FAISS index
-            scores, indices = self.faiss_index.search(query_embedding, top_k)
+            # Normalize query embedding for cosine similarity
+            query_norm = np.linalg.norm(query_embedding)
+            query_embedding = query_embedding / query_norm
+            
+            # Search vector index using numpy (cosine similarity)
+            similarities = np.dot(self.vector_index, query_embedding.T).flatten()
+            indices = np.argsort(similarities)[::-1][:top_k]  # Top k results
+            scores = similarities[indices]
             
             results = []
             for score, idx in zip(scores[0], indices[0]):
@@ -831,7 +836,7 @@ def health_check():
     try:
         system_status = {
             'status': 'healthy',
-            'system_initialized': rag_bot.faiss_index is not None,
+            'system_initialized': rag_bot.vector_index is not None,
             'knowledge_base_size': len(rag_bot.knowledge_base),
             'apis_configured': {
                 'cohere': bool(rag_bot.cohere_api_key),
@@ -878,7 +883,7 @@ def knowledge_base_info():
             'total_chunks': len(rag_bot.knowledge_base),
             'sources': list(set(chunk['source'] for chunk in rag_bot.knowledge_base)),
             'embedding_dimension': rag_bot.embeddings.shape[1] if rag_bot.embeddings is not None else 0,
-            'faiss_index_size': rag_bot.faiss_index.ntotal if rag_bot.faiss_index else 0
+            'vector_index_size': len(rag_bot.vector_index) if rag_bot.vector_index is not None else 0
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -932,7 +937,7 @@ if __name__ == '__main__':
     print("🚀 Starting RAG Customer Support Chatbot...")
     print("📊 Features enabled:")
     print("  - Cohere embeddings for vector search")
-    print("  - FAISS for similarity matching")
+    print("  - NumPy for similarity matching")
     print("  - Groq LLM for response generation")
     print("  - Intelligent entity extraction")
     print("  - Intent classification")
