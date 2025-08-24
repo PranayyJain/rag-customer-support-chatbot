@@ -483,7 +483,7 @@ class RAGChatbot:
             return []
     
     def generate_response(self, query: str, context: List[Dict], intent: str, entities: Dict, conversation_context: List[Dict] = None) -> str:
-        """Generate response using Groq LLM only if relevant content is found"""
+        """Generate response using decision tree flow to avoid infinite loops"""
         try:
             # Handle greetings first
             if intent == 'greeting':
@@ -497,217 +497,383 @@ class RAGChatbot:
 
 How can I assist you today?"""
             
-            # EARLY EXIT: Only for return requests with complete information
-            if intent == 'return' and conversation_context and len(conversation_context) > 0:
-                has_order_id = any('order_id' in msg.get('entities', {}) for msg in conversation_context)
-                has_product = any('product' in msg.get('entities', {}) for msg in conversation_context)
-                
-                if has_order_id and has_product:
-                    logger.info("Early exit triggered - creating ticket for return request")
-                    return """Perfect! I have all the information I need to process your return request.
-
-I've created a support ticket for you, and our team will contact you within 2 hours to arrange the return process. This ensures we handle your return request correctly and efficiently.
-
-Thank you for contacting us. Is there anything else I can help you with today?"""
-                
-                # If we have order_id but no product, ask for product info
-                elif has_order_id and not has_product:
-                    order_id = None
-                    for msg in conversation_context:
-                        if 'order_id' in msg.get('entities', {}):
-                            order_id = msg['entities']['order_id']
-                            break
-                    
-                    return f"""Great! I have your order ID: {order_id}. Now I just need:
-
-🔍 **Product Information:**
-- Product name/item description
-- Reason for return
-- Whether the item is defective or just unwanted
-
-Once you provide the product details, I can process your return request immediately."""
+            # DECISION TREE: Check if we have enough info to resolve the issue
+            resolution_result = self._check_resolution_ready(intent, entities, conversation_context)
+            if resolution_result['can_resolve']:
+                return self._generate_resolution_response(intent, resolution_result, conversation_context)
             
-            # Check if query is e-commerce related
-            if not self.is_ecommerce_related(query, conversation_context):
-                return """I apologize, but I'm specifically designed to help with e-commerce customer support inquiries only. 
-
-Your question appears to be outside the scope of our customer support services. I've automatically created a support ticket for you, and our supervisor will contact you within 2 hours to assist with your request.
-
-For immediate assistance with non-e-commerce matters, please contact the appropriate department or service provider."""
-            
-            # Handle different intents appropriately when no knowledge base content is found
-            if not context or len(context) == 0:
-                # Check if we have context from conversation that we can use
-                if conversation_context and len(conversation_context) > 0:
-                    # Look for entities in conversation context
-                    context_entities = {}
-                    for msg in conversation_context:
-                        if msg.get('entities'):
-                            for key, value in msg['entities'].items():
-                                if key not in context_entities:
-                                    context_entities[key] = value
-                    
-                    # If we have order_id, provide more specific help
-                    if 'order_id' in context_entities:
-                        if intent == 'shipping':
-                            return f"""Great! I can see your order ID: {context_entities['order_id']}. 
-
-📦 **Shipping Information for Order {context_entities['order_id']}:**
-- Standard shipping: 5-7 business days
-- Express shipping: 2-3 business days
-- Free shipping on orders over $50
-- Tracking numbers provided within 24 hours
-
-🔍 **To help you better, I need:**
-- Current shipping status
-- Whether you received a tracking number
-- Specific delivery issue you're experiencing
-
-Would you like me to create a support ticket so our shipping team can assist you directly?"""
-                        
-                        elif intent == 'return':
-                            return f"""Perfect! I have your order ID: {context_entities['order_id']}. 
-
-🔄 **Return Requirements:**
-- Items can be returned within 30 days of purchase
-- Original packaging is required
-- Return shipping is free for defective items
-- Refunds issued to original payment method
-
-🔍 **Now I just need:**
-- Product name/item description
-- Reason for return
-- Whether the item is defective or just unwanted
-
-Once you provide the product details, I can process your return request immediately."""
-                
-                # Fall back to intent-specific response
-                return self._get_intent_specific_response(intent, query, conversation_context)
-            
-            # If we have relevant context, use the API to generate a response
-            # Prepare context
-            context_text = "\n\n".join([chunk['content'] for chunk in context])
-            
-            # Create system prompt with conversation context
-            conversation_summary = ""
-            if conversation_context and len(conversation_context) > 0:
-                recent_messages = conversation_context[-3:]  # Last 3 messages
-                conversation_summary = "\n\nConversation History:\n"
-                for i, msg in enumerate(recent_messages):
-                    conversation_summary += f"User: {msg.get('query', '')}\n"
-                    if msg.get('entities'):
-                        conversation_summary += f"Extracted: {msg.get('entities')}\n"
-            
-            system_prompt = f"""You are an intelligent customer support assistant for an e-commerce platform. 
-            You have access to a comprehensive knowledge base and should provide helpful, accurate responses.
-            
-            User Intent: {intent}
-            Extracted Information: {entities}
-            
-            Guidelines:
-            - Be helpful, professional, and empathetic
-            - Use the provided context to answer questions accurately
-            - Remember information from the conversation history
-            - Don't ask for information that was already provided
-            - If you detect billing issues, technical problems, or complaints that need escalation, mention creating a support ticket
-            - For complex issues, offer to escalate to human support
-            - Be specific and actionable in your responses
-            - ONLY respond to e-commerce related queries (orders, payments, shipping, accounts, etc.)
-            - If a query is not e-commerce related, politely redirect to appropriate channels
-            
-            IMPORTANT CONVERSATION HANDLING:
-            - If this is a follow-up message in an ongoing conversation, use the conversation history
-            - Product names (like "aqualogica sunscreen") are valid e-commerce queries
-            - Don't treat product names or follow-up questions as off-topic
-            - Provide specific, actionable steps based on the conversation context
-            - If someone mentions a product name, assume it's related to their ongoing issue
-            
-            Context from Knowledge Base:
-            {context_text}
-            {conversation_summary}
-            """
-            
-            # Generate response using Groq
-            if not self.groq_client:
-                return "I apologize, but I'm currently unable to generate responses. Please check your API configuration."
-            
-            response = self.groq_client.chat.completions.create(
-                model="llama3-8b-8192",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": query}
-                ],
-                max_tokens=512,
-                temperature=0.7
-            )
-            
-            return response.choices[0].message.content
+            # If we can't resolve yet, ask for missing information
+            return self._ask_for_missing_info(intent, entities, conversation_context)
             
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-            
-            # If we have relevant context, use the API to generate a response
-            # Prepare context
-            context_text = "\n\n".join([chunk['content'] for chunk in context])
-            
-            # Create system prompt with conversation context
-            conversation_summary = ""
+    
+    def _check_resolution_ready(self, intent: str, entities: Dict, conversation_context: List[Dict] = None) -> Dict:
+        """Check if we have enough information to resolve the issue"""
+        try:
+            # Get all entities from conversation context
+            context_entities = {}
             if conversation_context and len(conversation_context) > 0:
-                recent_messages = conversation_context[-3:]  # Last 3 messages
-                conversation_summary = "\n\nConversation History:\n"
-                for i, msg in enumerate(recent_messages):
-                    conversation_summary += f"User: {msg.get('query', '')}\n"
+                for msg in conversation_context:
                     if msg.get('entities'):
-                        conversation_summary += f"Extracted: {msg.get('entities')}\n"
+                        for key, value in msg['entities'].items():
+                            if key not in context_entities:
+                                context_entities[key] = value
             
-            system_prompt = f"""You are an intelligent customer support assistant for an e-commerce platform. 
-            You have access to a comprehensive knowledge base and should provide helpful, accurate responses.
+            # Merge with current entities
+            all_entities = {**context_entities, **entities}
             
-            User Intent: {intent}
-            Extracted Information: {entities}
+            # Define resolution requirements for each intent
+            resolution_requirements = {
+                'shipping': {
+                    'required': ['order_id'],
+                    'optional': ['product', 'delivery_date'],
+                    'can_resolve': lambda e: 'order_id' in e
+                },
+                'return': {
+                    'required': ['order_id', 'product'],
+                    'optional': ['reason'],
+                    'can_resolve': lambda e: 'order_id' in e and 'product' in e
+                },
+                'billing': {
+                    'required': ['order_id'],
+                    'optional': ['amount', 'date'],
+                    'can_resolve': lambda e: 'order_id' in e
+                },
+                'technical': {
+                    'required': ['issue_description'],
+                    'optional': ['device', 'browser'],
+                    'can_resolve': lambda e: 'issue_description' in e
+                },
+                'account': {
+                    'required': ['email'],
+                    'optional': ['issue_type'],
+                    'can_resolve': lambda e: 'email' in e
+                }
+            }
             
-            Guidelines:
-            - Be helpful, professional, and empathetic
-            - Use the provided context to answer questions accurately
-            - Remember information from the conversation history
-            - Don't ask for information that was already provided
-            - If you detect billing issues, technical problems, or complaints that need escalation, mention creating a support ticket
-            - For complex issues, offer to escalate to human support
-            - Be specific and actionable in your responses
-            - ONLY respond to e-commerce related queries (orders, payments, shipping, accounts, etc.)
-            - If a query is not e-commerce related, politely redirect to appropriate channels
+            if intent not in resolution_requirements:
+                return {'can_resolve': False, 'missing': [], 'entities': all_entities}
             
-            IMPORTANT CONVERSATION HANDLING:
-            - If this is a follow-up message in an ongoing conversation, use the conversation history
-            - Product names (like "aqualogica sunscreen") are valid e-commerce queries
-            - Don't treat product names or follow-up questions as off-topic
-            - Provide specific, actionable steps based on the conversation context
-            - If someone mentions a product name, assume it's related to their ongoing issue
+            req = resolution_requirements[intent]
+            can_resolve = req['can_resolve'](all_entities)
             
-            Context from Knowledge Base:
-            {context_text}
-            {conversation_summary}
-            """
+            # Find missing required fields
+            missing = [field for field in req['required'] if field not in all_entities]
             
-            # Generate response using Groq
-            if not self.groq_client:
-                return "I apologize, but I'm currently unable to generate responses. Please check your API configuration."
-            
-            response = self.groq_client.chat.completions.create(
-                model="llama3-8b-8192",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": query}
-                ],
-                max_tokens=512,
-                temperature=0.7
-            )
-            
-            return response.choices[0].message.content
+            return {
+                'can_resolve': can_resolve,
+                'missing': missing,
+                'entities': all_entities,
+                'intent': intent
+            }
             
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
+            logger.error(f"Error checking resolution readiness: {e}")
+            return {'can_resolve': False, 'missing': [], 'entities': {}, 'intent': intent}
+    
+    def _generate_resolution_response(self, intent: str, resolution_result: Dict, conversation_context: List[Dict] = None) -> str:
+        """Generate resolution response when we have enough information"""
+        try:
+            entities = resolution_result['entities']
+            intent = resolution_result['intent']
+            
+            if intent == 'shipping':
+                order_id = entities.get('order_id', 'your order')
+                return f"""✅ **Shipping Issue Resolved!**
+
+I have all the information I need to help with your shipping concern for order {order_id}.
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Issue: Shipping inquiry for order {order_id}
+- Priority: Normal
+
+Our shipping team will review your order and contact you within 2 hours with:
+- Current shipping status
+- Tracking information
+- Estimated delivery date
+- Any necessary actions
+
+Is there anything else I can help you with today?"""
+            
+            elif intent == 'return':
+                order_id = entities.get('order_id', 'your order')
+                product = entities.get('product', 'the item')
+                return f"""✅ **Return Request Processed!**
+
+I have all the information needed for your return request:
+- Order ID: {order_id}
+- Product: {product}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Return request
+- Priority: High
+
+Our returns team will contact you within 2 hours to:
+- Confirm return details
+- Provide return shipping label
+- Process your refund/replacement
+- Arrange pickup if needed
+
+Is there anything else I can help you with today?"""
+            
+            elif intent == 'billing':
+                order_id = entities.get('order_id', 'your order')
+                return f"""✅ **Billing Issue Addressed!**
+
+I have your order ID: {order_id} and will investigate your billing concern.
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Billing inquiry
+- Priority: Normal
+
+Our billing team will contact you within 2 hours to:
+- Review your account
+- Resolve the billing issue
+- Process any necessary refunds
+- Update payment methods if needed
+
+Is there anything else I can help you with today?"""
+            
+            elif intent == 'technical':
+                issue = entities.get('issue_description', 'your technical issue')
+                return f"""✅ **Technical Issue Logged!**
+
+I've recorded your technical concern: {issue}
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Technical support
+- Priority: Normal
+
+Our technical team will contact you within 2 hours to:
+- Troubleshoot the issue
+- Provide step-by-step solutions
+- Escalate if needed
+- Follow up until resolved
+
+Is there anything else I can help you with today?"""
+            
+            elif intent == 'account':
+                email = entities.get('email', 'your account')
+                return f"""✅ **Account Issue Addressed!**
+
+I have your email: {email} and will help with your account concern.
+
+🎫 **Support Ticket Created**
+- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
+- Type: Account support
+- Priority: Normal
+
+Our account team will contact you within 2 hours to:
+- Verify your identity
+- Resolve the account issue
+- Provide necessary instructions
+- Ensure secure access
+
+Is there anything else I can help you with today?"""
+            
+            else:
+                return """✅ **Issue Logged Successfully!**
+
+I've recorded your concern and created a support ticket.
+
+🎫 **Support Ticket Created**
+- Our team will contact you within 2 hours
+- We'll work to resolve your issue promptly
+- You'll receive regular updates
+
+Is there anything else I can help you with today?"""
+                
+        except Exception as e:
+            logger.error(f"Error generating resolution response: {e}")
+            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
+    
+    def _ask_for_missing_info(self, intent: str, entities: Dict, conversation_context: List[Dict] = None) -> str:
+        """Ask for missing information based on intent and current entities"""
+        try:
+            # Get all entities from conversation context
+            context_entities = {}
+            if conversation_context and len(conversation_context) > 0:
+                for msg in conversation_context:
+                    if msg.get('entities'):
+                        for key, value in msg['entities'].items():
+                            if key not in context_entities:
+                                context_entities[key] = value
+            
+            # Merge with current entities
+            all_entities = {**context_entities, **entities}
+            
+            # Define what we need for each intent
+            intent_requirements = {
+                'shipping': {
+                    'primary': 'order ID',
+                    'secondary': 'specific shipping issue',
+                    'example': 'e.g., "Where is my order 12345?" or "My package is delayed"'
+                },
+                'return': {
+                    'primary': 'order ID and product name',
+                    'secondary': 'reason for return',
+                    'example': 'e.g., "I want to return order 12345, I received the wrong shampoo"'
+                },
+                'billing': {
+                    'primary': 'order ID or transaction ID',
+                    'secondary': 'specific billing issue',
+                    'example': 'e.g., "I was charged twice for order 12345"'
+                },
+                'technical': {
+                    'primary': 'description of the technical issue',
+                    'secondary': 'device/browser information',
+                    'example': 'e.g., "I can\'t log into my account" or "The app keeps crashing"'
+                },
+                'account': {
+                    'primary': 'email address',
+                    'secondary': 'specific account issue',
+                    'example': 'e.g., "I forgot my password for john@email.com"'
+                }
+            }
+            
+            if intent not in intent_requirements:
+                return """I understand you need help, but I need more specific information to assist you properly.
+
+🔍 **To help you better, please provide:**
+- What specific issue you're experiencing
+- Any relevant order IDs or account details
+- What you were trying to do when the problem occurred
+
+This will help me create the right type of support ticket for you."""
+            
+            req = intent_requirements[intent]
+            
+            # Check what we already have
+            has_order_id = 'order_id' in all_entities
+            has_product = 'product' in all_entities
+            has_email = 'email' in all_entities
+            
+            # Build response based on what's missing
+            if intent == 'shipping' and not has_order_id:
+                return f"""📦 **Shipping Assistance**
+
+I'd be happy to help with your shipping concern!
+
+🔍 **I need your order ID to assist you:**
+- Please provide your order number
+- You can find this in your order confirmation email
+- Or check your account order history
+
+**Example:** "My order ID is 12345" or "Where is order 12345?"
+
+Once you provide the order ID, I can immediately create a support ticket and get our shipping team involved."""
+            
+            elif intent == 'return':
+                if not has_order_id:
+                    return f"""🔄 **Return Request**
+
+I'd be happy to help you with your return!
+
+🔍 **I need your order ID to assist you:**
+- Please provide your order number
+- You can find this in your order confirmation email
+
+**Example:** "I want to return order 12345"
+
+Once you provide the order ID, I can help process your return request."""
+                elif not has_product:
+                    order_id = all_entities.get('order_id', 'your order')
+                    return f"""✅ **Order ID Received: {order_id}**
+
+Great! Now I just need:
+
+🔍 **Product Information:**
+- What product did you receive?
+- What product did you order?
+- Is it the wrong item, defective, or unwanted?
+
+**Example:** "I ordered Head & Shoulders shampoo but received sunscreen"
+
+Once you provide the product details, I can immediately process your return request and create a support ticket."""
+            
+            elif intent == 'billing' and not has_order_id:
+                return f"""💳 **Billing Assistance**
+
+I'd be happy to help with your billing concern!
+
+🔍 **I need your order ID or transaction ID:**
+- Please provide your order number
+- Or the transaction ID from your bank statement
+- You can find this in your order confirmation email
+
+**Example:** "I was charged twice for order 12345"
+
+Once you provide the order ID, I can immediately investigate and create a support ticket."""
+            
+            elif intent == 'technical':
+                return f"""🛠️ **Technical Support**
+
+I'd be happy to help with your technical issue!
+
+🔍 **Please describe the problem:**
+- What exactly is happening?
+- What were you trying to do?
+- What error messages do you see?
+- What device/browser are you using?
+
+**Examples:**
+- "I can't log into my account"
+- "The app keeps crashing on my iPhone"
+- "I get an error when trying to checkout"
+
+Once you provide details, I can create a support ticket for our technical team."""
+            
+            elif intent == 'account':
+                if not has_email:
+                    return f"""🔐 **Account Support**
+
+I'd be happy to help with your account issue!
+
+🔍 **I need your email address:**
+- Please provide the email associated with your account
+- This helps me verify your identity and access
+
+**Example:** "I can't log into john@email.com"
+
+Once you provide your email, I can immediately assist with your account concern."""
+                else:
+                    email = all_entities.get('email', 'your account')
+                    return f"""✅ **Email Received: {email}**
+
+Great! Now I just need:
+
+🔍 **Specific Account Issue:**
+- What exactly is the problem?
+- Can you currently log in?
+- Are you locked out?
+- Do you need password reset?
+
+**Examples:**
+- "I forgot my password"
+- "My account is locked"
+- "I need to update my profile"
+
+Once you describe the issue, I can immediately assist you and create a support ticket if needed."""
+            
+            else:
+                return f"""I understand you need help with {intent}, but I need more specific information to assist you properly.
+
+🔍 **To help you better, please provide:**
+- {req['primary']}
+- {req['secondary']}
+
+**Example:** {req['example']}
+
+This will help me create the right type of support ticket and get you the help you need."""
+                
+        except Exception as e:
+            logger.error(f"Error asking for missing info: {e}")
             return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
     
     def _get_intent_specific_response(self, intent: str, query: str, conversation_context: List[Dict] = None) -> str:
