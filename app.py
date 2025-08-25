@@ -636,15 +636,15 @@ class StructuredExtractor:
                     logger.info("LangExtract loaded successfully for structured extraction.")
                 else:
                     self.available = False
-                    logger.warning("LangExtract Schema not found")
+                    logger.info("LangExtract Schema not found")
             else:
                 raise ImportError("langextract module not found")
                 
         except ImportError:
-            logger.warning("LangExtract not available. Install google-langextract to enable structured extraction.")
+            logger.info("LangExtract not available. Install google-langextract to enable structured extraction.")
             self.available = False
         except Exception as e:
-            logger.warning("LangExtract import failed: %s", e)
+            logger.info("LangExtract import failed: %s", e)
             self.available = False
         if self.available and self.Schema:
             try:
@@ -714,7 +714,7 @@ class StructuredExtractor:
                 return naive_entity_extract(text)
                 
         except ImportError:
-            logger.warning("LangExtract not available; using regex fallback.")
+            logger.info("LangExtract not available; using regex fallback.")
             return naive_entity_extract(text)
         except Exception as e:
             logger.exception("LangExtract extraction failed; fallback to regex: %s", e)
