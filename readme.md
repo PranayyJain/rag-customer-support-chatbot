@@ -9,6 +9,23 @@ A powerful AI-powered customer support chatbot that uses Retrieval-Augmented Gen
 
 ## 🚀 **Live Demo**
 
+Experience the RAG Customer Support Chatbot in action! Watch these demonstrations to see how the chatbot handles various customer support scenarios:
+
+### 🎬 **Demo Videos**
+
+#### **1. Customer Support AI Chatbot - General Interaction**
+![Customer Support AI Chatbot General Demo](demo/Customer%20Support%20AI%20Chatbot.gif)
+*Watch the chatbot handle general customer support queries with intelligent responses*
+
+#### **2. Customer Support AI Chatbot - Advanced Features**
+![Customer Support AI Chatbot Advanced Demo](demo/Customer%20Support%20AI%20Chatbot%202%20(1).gif)
+*See advanced features like intent classification and entity extraction in action*
+
+#### **3. Customer Support AI Chatbot - Ticket Creation**
+![Customer Support AI Chatbot Ticket Demo](demo/Customer%20Support%20AI%20Chatbot%203.gif)
+*Observe automatic ticket creation for queries that require human intervention*
+
+### 🔗 **Quick Links**
 - **Demo URL**: [Coming Soon]
 - **Documentation**: [Full Documentation](https://github.com/yourusername/rag-customer-support-chatbot/wiki)
 - **Issues**: [Report Issues](https://github.com/yourusername/rag-customer-support-chatbot/issues)
@@ -19,7 +36,7 @@ A powerful AI-powered customer support chatbot that uses Retrieval-Augmented Gen
 
 - **PDF Knowledge Base**: Automatically processes and indexes PDF documents
 - **Vector Search**: Uses Cohere embeddings for semantic similarity matching
-- **FAISS Index**: Fast and efficient similarity search
+- **Vector Search**: Fast and efficient similarity search using NumPy
 - **Intelligent Response Generation**: Only uses Groq LLM when relevant content exists
 
 ### 🎯 **Smart Query Handling**
@@ -47,7 +64,7 @@ A powerful AI-powered customer support chatbot that uses Retrieval-Augmented Gen
 
 ### **Performance Features**
 
-- **Fast Vector Search**: FAISS index for sub-second response times
+- **Fast Vector Search**: NumPy-based vector search for sub-second response times
 - **Efficient Chunking**: Optimal text chunking for better search results
 - **Memory Optimization**: Smart memory management for large knowledge bases
 - **Async Processing**: Non-blocking operations for better user experience
@@ -465,7 +482,7 @@ We welcome contributions! See our [Contributing Guide](CONTRIBUTING.md) for deta
 
 ---
 
-**Built with ❤️ using Flask, Cohere, FAISS, and Groq**
+**Built with ❤️ using Flask, Cohere, NumPy, and Groq**
 
 ---
 
