@@ -14,10 +14,10 @@ worker_class = "uvicorn.workers.UvicornWorker"
 worker_connections = 1000
 max_requests = 1000
 max_requests_jitter = 50
-preload_app = True  # Preload app to avoid memory issues
+preload_app = False  # Avoid heavy initialization before worker fork
 
 # Timeout settings
-timeout = 120  # Increase timeout to 2 minutes
+timeout = 300  # Allow longer cold starts (index build)
 keepalive = 2
 graceful_timeout = 30
 
