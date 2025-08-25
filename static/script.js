@@ -86,10 +86,11 @@ class ChatbotUI {
             this.addMessage(response.response, 'bot', response.metadata);
             
             // Update analytics if available
-            if (response.metadata && response.metadata.ticket_id) {
-                // Check if this was an off-topic query
-                const isOffTopic = !this.isEcommerceRelated(message);
-                // Check if content was found (relevant_chunks > 0 means content was found)
+            // Only show ticket creation when the backend explicitly creates one
+            // Don't automatically decide based on frontend logic
+            if (response.metadata && response.metadata.ticket_id && response.metadata.intent === 'off-topic') {
+                // Only show ticket creation if the backend explicitly says it's off-topic
+                const isOffTopic = true;
                 const hasContent = response.metadata.relevant_chunks > 0;
                 this.showTicketCreated(response.metadata.ticket_id, isOffTopic, hasContent);
             }
@@ -309,6 +310,37 @@ class ChatbotUI {
             
             // Generate new conversation ID
             this.conversationId = this.generateConversationId();
+            
+            // Reset input
+            this.messageInput.value = '';
+            this.updateCharCount();
+        }
+    }
+    
+    resetConversation() {
+        if (confirm('Reset conversation and start fresh?')) {
+            // Clear backend conversation state
+            if (this.conversationId) {
+                fetch('/api/clear-chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        conversation_id: this.conversationId
+                    })
+                }).catch(error => {
+                    console.error('Error clearing chat:', error);
+                });
+            }
+            
+            // Generate new conversation ID
+            this.conversationId = this.generateConversationId();
+            
+            // Clear all messages except welcome
+            const welcomeMessage = this.chatMessages.querySelector('.message.bot-message');
+            this.chatMessages.innerHTML = '';
+            this.chatMessages.appendChild(welcomeMessage);
             
             // Reset input
             this.messageInput.value = '';

@@ -7,4 +7,14 @@ PyPDF2==3.0.1
 numpy==1.26.4
 python-dotenv==1.0.0
 gunicorn==21.2.0
+faiss-cpu==1.7.4
+rank-bm25==0.2.2
+pymupdf==1.23.8
+google-generativeai==0.3.2
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+openai==1.101.0
+langextract==1.0.8
+Jinja2==3.1.3
 

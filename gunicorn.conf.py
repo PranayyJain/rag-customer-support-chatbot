@@ -1,13 +1,16 @@
 # Gunicorn configuration for stability
 import multiprocessing
+import os
 
 # Server socket
-bind = "0.0.0.0:10000"
+# Respect Render's PORT environment variable
+PORT = os.getenv("PORT", "10000")
+bind = f"0.0.0.0:{PORT}"
 backlog = 2048
 
 # Worker processes
 workers = 1  # Single worker for Render free tier
-worker_class = "sync"
+worker_class = "uvicorn.workers.UvicornWorker"
 worker_connections = 1000
 max_requests = 1000
 max_requests_jitter = 50

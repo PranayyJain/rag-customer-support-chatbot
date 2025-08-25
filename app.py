@@ -1,2688 +1,1819 @@
+#!/usr/bin/env python3
+"""
+app.py — Intelligent Customer Support Chatbot (Single-file implementation)
+
+Covers the 4 required parts end‑to‑end:
+
+Part 1: Intent Classification
+  • Multi-intent detection (billing, technical, account, complaints, general)
+  • Entity extraction (order_id, email, phone, dates, product) via regex + optional spaCy
+  • Confidence scoring and routing signals
+
+Part 2: Knowledge Base Integration (RAG)
+  • Load documents (PDF/Markdown/TXT/CSV)
+  • Chunking with metadata
+  • Hybrid Retrieval: FAISS (semantic) + BM25 (keyword)
+  • Optional Cross-Encoder reranker (HuggingFace transformers)
+  • Context packing with token budget and citations
+  • Answer extraction / generation (Gemini or OpenAI or GROQ) via unified LLM interface
+
+Part 3: Conversation Management
+  • Memory: buffer + summarization (token-aware) for long dialogs
+  • Clarifying questions when ambiguity/low-confidence
+  • Graceful fallbacks (no-answer, handoff)
+
+Part 4: Analytics & Improvement
+  • Request/response timing, retrieval metrics, hit/miss analytics
+  • Satisfaction signal ingestion (thumbs up/down)
+  • Minimal continuous learning hooks (intent keyword expansion)
+
+FASTAPI API
+  • POST /chat  — main chat endpoint
+  • POST /feedback — record satisfaction feedback
+  • GET  /health — liveness
+  • GET  /metrics — minimal metrics snapshot
+
+CLI
+  • python app.py --rebuild-index --data ./data
+
+Notes
+  • Keep API keys in environment variables.
+  • External deps are optional and guarded (spaCy, transformers, google-langextract).
+  • This file is intentionally verbose with comments for clarity.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import collections
+import dataclasses
+import fnmatch
+import hashlib
+import io
+import json
+import logging
+import math
 import os
+import random
+import re
+import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Any, Union
-from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-from flask import Flask, request, jsonify, render_template
-from flask_cors import CORS
-import cohere
-from groq import Groq
-import PyPDF2
+# ------------------------------
+# Configuration & Logging
+# ------------------------------
 
-import re
-from collections import defaultdict
-import logging
-from config import Config
+APP_NAME = "rag_support_bot"
+DEFAULT_DATA_DIR = os.getenv("DATA_DIR", "./data")
+INDEX_DIR = os.getenv("INDEX_DIR", "./index_store")
+LOG_DIR = os.getenv("LOG_DIR", "./logs")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Model config (env-driven)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "cohere")  # cohere | openai | sentence-transformers
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "embed-multilingual-v3.0")
 
-app = Flask(__name__, static_folder='static', static_url_path='/static')
-CORS(app)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")  # gemini | openai | groq
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-1.5-flash")
 
-class RAGChatbot:
-    def __init__(self):
-        # Initialize APIs
-        self.cohere_api_key = Config.COHERE_API_KEY
-        self.groq_api_key = Config.GROQ_API_KEY
-        
-        # DST Flow Engine - Session memory for each conversation
-        self.user_states = {}  # {conv_id: {"flow": str, "step": int, "data": dict, "started_at": float}}
-        
-        # Declarative flows - single source of truth
-        self.flows = {
-            "return": {
-                "required_slots": [
-                    {"key": "order_id", "ask": "🔄 **Return Request**\n\nI'd be happy to help you with your return!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n\n**Example:** \"I want to return order 12345\"\n\nOnce you provide the order ID, I can help process your return request."},
-                    {"key": "reason", "ask": lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the reason for your return:\n\n🔍 **Why are you returning this item?**\n- Damaged or defective product\n- Wrong item received\n- Size doesn\'t fit\n- Changed your mind\n- Other reason\n\n**Example:** "The product was damaged during shipping" or "I received the wrong item"\n\nOnce you tell me the reason, I can process your return request.'},
-                    {"key": "resolution", "ask": lambda data: f'✅ **Return Details Complete**\n\nPerfect! I have all the information I need:\n- Order ID: {data.get("order_id", "your order")}\n- Reason: {data.get("reason", "your return reason")}\n\nNow I need to know your preference:\n\n🔍 **What would you like?**\n- **Refund**: Money back to your original payment method\n- **Replacement**: Same item shipped to you again\n- **Exchange**: Different item of equal value\n\n**Example:** "I want a refund" or "I\'d like a replacement"\n\nOnce you choose, I can immediately process your request and create a support ticket.'}
-                ],
-                "finalize": lambda data: self._finalize_return_flow_dst(data)
-            },
-            "shipping": {
-                "required_slots": [
-                    {"key": "order_id", "ask": "📦 **Shipping Assistance**\n\nI'd be happy to help with your shipping concern!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n- Or check your account order history\n\n**Example:** \"My order ID is 12345\" or \"Where is order 12345?\"\n\nOnce you provide the order ID, I can immediately create a support ticket and get our shipping team involved."},
-                    {"key": "shipping_issue", "ask": lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific shipping issue:\n\n🔍 **What shipping problem are you experiencing?**\n- Package not delivered\n- Delayed delivery\n- Wrong address\n- Damaged package\n- Tracking not working\n- Other shipping concern\n\n**Example:** "My package was supposed to arrive yesterday but it\'s still not here"\n\nOnce you describe the issue, I can create a support ticket for our shipping team.'}
-                ],
-                "finalize": lambda data: self._finalize_shipping_flow_dst(data)
-            },
-            "billing": {
-                "required_slots": [
-                    {"key": "order_id", "ask": "💳 **Billing Assistance**\n\nI'd be happy to help with your billing concern!\n\n🔍 **I need your order ID or transaction ID:**\n- Please provide your order number\n- Or the transaction ID from your bank statement\n- You can find this in your order confirmation email\n\n**Example:** \"I was charged twice for order 12345\"\n\nOnce you provide the order ID, I can immediately investigate and create a support ticket."},
-                    {"key": "billing_issue", "ask": lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific billing issue:\n\n🔍 **What billing problem are you experiencing?**\n- Duplicate charge\n- Incorrect amount charged\n- Payment failed\n- Refund not received\n- Subscription billing issue\n- Other billing concern\n\n**Example:** "I was charged twice for the same order" or "My payment failed during checkout"\n\nOnce you describe the issue, I can investigate and create a support ticket.'}
-                ],
-                "finalize": lambda data: self._finalize_billing_flow_dst(data)
-            },
-            "technical": {
-                "required_slots": [
-                    {"key": "issue_description", "ask": "🛠️ **Technical Support**\n\nI'd be happy to help with your technical issue!\n\n🔍 **Please describe the problem:**\n- What exactly is happening?\n- What were you trying to do?\n- What error messages do you see?\n- What device/browser are you using?\n\n**Examples:**\n- \"I can\'t log into my account\"\n- \"The app keeps crashing on my iPhone\"\n- \"I get an error when trying to checkout\"\n\nOnce you provide details, I can create a support ticket for our technical team."},
-                    {"key": "device_info", "ask": lambda data: f'✅ **Issue Description Received**\n\nGreat! I understand: {data.get("issue_description", "your technical issue")}\n\nNow I need to know your device information:\n\n🔍 **What device/browser are you using?**\n- Device type (iPhone, Android, Windows, Mac, etc.)\n- Browser (Chrome, Safari, Firefox, Edge)\n- App version (if using mobile app)\n- Operating system version\n\n**Example:** "iPhone 14 with iOS 17, using Safari"\n\nOnce you provide this, I can create a support ticket for our technical team.'}
-                ],
-                "finalize": lambda data: self._finalize_technical_flow_dst(data)
-            },
-            "account": {
-                "required_slots": [
-                    {"key": "email", "ask": "🔐 **Account Support**\n\nI'd be happy to help with your account issue!\n\n🔍 **I need your email address:**\n- Please provide the email associated with your account\n- This helps me verify your identity and access\n\n**Example:** \"I can\'t log into john@email.com\"\n\nOnce you provide your email, I can immediately assist with your account concern."},
-                    {"key": "account_issue", "ask": lambda data: f'✅ **Email Received: {data.get("email", "your account")}**\n\nGreat! Now I need to know the specific account issue:\n\n🔍 **What account problem are you experiencing?**\n- Can\'t log in\n- Forgot password\n- Account locked\n- Need to update profile\n- Two-factor authentication issue\n- Other account concern\n\n**Examples:**\n- \"I forgot my password\"\n- \"My account is locked after too many failed attempts\"\n- \"I need to update my email address\"\n\nOnce you describe the issue, I can assist you and create a support ticket if needed.'}
-                ],
-                "finalize": lambda data: self._finalize_account_flow_dst(data)
-            },
-            "greeting": {
-                "required_slots": [],
-                "finalize": lambda data: """Hello! I'm your AI customer support assistant. I can help you with:
+# Optional reranker
+RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") == "1"
+RERANK_MODEL = os.getenv("RERANK_MODEL", "rerank-multilingual-v3.0")
 
-🔐 Account and password issues
-💳 Billing and payment questions
-🛠️ Technical support
-📦 Shipping and delivery
-🔄 Returns and refunds
+# Memory / tokens
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "3000"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
+TOP_K = int(os.getenv("TOP_K", "5"))
+HYBRID_WEIGHTS = tuple(float(x) for x in os.getenv("HYBRID_WEIGHTS", "0.6,0.4").split(","))  # (semantic, keyword)
 
-How can I assist you today?"""
-            }
-        }
-        
-        # Intent canonical mapping with typo handling
-        self.intent_canonical = {
-            "greeting": {"hi", "hello", "hey", "good morning", "good afternoon", "good evening", "morning", "afternoon", "evening"},
-            "return": {"return", "refund", "replacement", "exchange", "redund", "refnd", "reund"},
-            "shipping": {"shipping", "delivery", "track", "status", "package", "arrived", "late", "delayed"},
-            "billing": {"billing", "payment", "charge", "invoice", "bill", "money", "cost", "fee"},
-            "account": {"account", "password", "login", "signin", "sign-in", "profile", "access"},
-            "technical": {"tech", "technical", "bug", "error", "crash", "app", "not working", "broken", "issue", "problem"}
-        }
-        
-        # Initialize clients
-        self.cohere_client = None
-        self.groq_client = None
-        
-        # Initialize clients only if API keys are available
-        if self.cohere_api_key and self.cohere_api_key != 'your_cohere_api_key_here':
-            try:
-                self.cohere_client = cohere.Client(self.cohere_api_key)
-            except Exception as e:
-                logger.warning(f"Failed to initialize Cohere client: {e}")
-        
-        if self.groq_api_key and self.groq_api_key != 'your_groq_api_key_here':
-            try:
-                self.groq_client = Groq(api_key=self.groq_api_key)
-            except Exception as e:
-                logger.warning(f"Failed to initialize Groq client: {e}")
-        
-        # System state
-        self.knowledge_base = []
-        self.embeddings = None
-        self.vector_index = None
-        self.conversation_history = {}
-        self.conversation_state = {}  # Track conversation state (order_id, product, etc.)
-        
-        # Active conversation state tracking (keeping for backward compatibility)
-        self.active_conversations = {}  # conversation_id -> conversation_state
-        
-        # Config-driven conversation flows (keeping for backward compatibility)
-        self.conversation_flows = {
-            'return': {
-                'steps': [
-                    {
-                        'entity': 'order_id',
-                        'ask': '🔄 **Return Request**\n\nI\'d be happy to help you with your return!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n\n**Example:** "I want to return order 12345"\n\nOnce you provide the order ID, I can help process your return request.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    },
-                    {
-                        'entity': 'reason',
-                        'ask': lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the reason for your return:\n\n🔍 **Why are you returning this item?**\n- Damaged or defective product\n- Wrong item received\n- Size doesn\'t fit\n- Changed your mind\n- Other reason\n\n**Example:** "The product was damaged during shipping" or "I received the wrong item"\n\nOnce you tell me the reason, I can process your return request.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    },
-                    {
-                        'entity': 'resolution_choice',
-                        'ask': lambda data: f'✅ **Return Details Complete**\n\nPerfect! I have all the information I need:\n- Order ID: {data.get("order_id", "your order")}\n- Reason: {data.get("reason", "your return reason")}\n\nNow I need to know your preference:\n\n🔍 **What would you like?**\n- **Refund**: Money back to your original payment method\n- **Replacement**: Same item shipped to you again\n- **Exchange**: Different item of equal value\n\n**Example:** "I want a refund" or "I\'d like a replacement"\n\nOnce you choose, I can immediately process your request and create a support ticket.',
-                        'validation': lambda x: bool(x and any(word in str(x).lower() for word in ['refund', 'replacement', 'exchange']))
-                    }
-                ],
-                'finalize': lambda data: self._finalize_return_flow(data)
-            },
-            'shipping': {
-                'steps': [
-                    {
-                        'entity': 'order_id',
-                        'ask': '📦 **Shipping Assistance**\n\nI\'d be happy to help with your shipping concern!\n\n🔍 **I need your order ID to assist you:**\n- Please provide your order number\n- You can find this in your order confirmation email\n- Or check your account order history\n\n**Example:** "My order ID is 12345" or "Where is order 12345?"\n\nOnce you provide the order ID, I can immediately create a support ticket and get our shipping team involved.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    },
-                    {
-                        'entity': 'shipping_issue',
-                        'ask': lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific shipping issue:\n\n🔍 **What shipping problem are you experiencing?**\n- Package not delivered\n- Delayed delivery\n- Wrong address\n- Damaged package\n- Tracking not working\n- Other shipping concern\n\n**Example:** "My package was supposed to arrive yesterday but it\'s still not here"\n\nOnce you describe the issue, I can create a support ticket for our shipping team.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    }
-                ],
-                'finalize': lambda data: self._finalize_shipping_flow(data)
-            },
-            'billing': {
-                'steps': [
-                    {
-                        'entity': 'order_id',
-                        'ask': '💳 **Billing Assistance**\n\nI\'d be happy to help with your billing concern!\n\n🔍 **I need your order ID or transaction ID:**\n- Please provide your order number\n- Or the transaction ID from your bank statement\n- You can find this in your order confirmation email\n\n**Example:** "I was charged twice for order 12345"\n\nOnce you provide the order ID, I can immediately investigate and create a support ticket.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    },
-                    {
-                        'entity': 'billing_issue',
-                        'ask': lambda data: f'✅ **Order ID Received: {data.get("order_id", "your order")}**\n\nGreat! Now I need to know the specific billing issue:\n\n🔍 **What billing problem are you experiencing?**\n- Duplicate charge\n- Incorrect amount charged\n- Payment failed\n- Refund not received\n- Subscription billing issue\n- Other billing concern\n\n**Example:** "I was charged twice for the same order" or "My payment failed during checkout"\n\nOnce you describe the issue, I can investigate and create a support ticket.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    }
-                ],
-                'finalize': lambda data: self._finalize_billing_flow(data)
-            },
-            'technical': {
-                'steps': [
-                    {
-                        'entity': 'issue_description',
-                        'ask': '🛠️ **Technical Support**\n\nI\'d be happy to help with your technical issue!\n\n🔍 **Please describe the problem:**\n- What exactly is happening?\n- What were you trying to do?\n- What error messages do you see?\n- What device/browser are you using?\n\n**Examples:**\n- "I can\'t log into my account"\n- "The app keeps crashing on my iPhone"\n- "I get an error when trying to checkout"\n\nOnce you provide details, I can create a support ticket for our technical team.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    },
-                    {
-                        'entity': 'device_info',
-                        'ask': lambda data: f'✅ **Issue Description Received**\n\nGreat! I understand: {data.get("issue_description", "your technical issue")}\n\nNow I need to know your device information:\n\n🔍 **What device/browser are you using?**\n- Device type (iPhone, Android, Windows, Mac, etc.)\n- Browser (Chrome, Safari, Firefox, Edge)\n- App version (if using mobile app)\n- Operating system version\n\n**Example:** "iPhone 14 with iOS 17, using Safari"\n\nOnce you provide this, I can create a support ticket for our technical team.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    }
-                ],
-                'finalize': lambda data: self._finalize_technical_flow(data)
-            },
-            'account': {
-                'steps': [
-                    {
-                        'entity': 'email',
-                        'ask': '🔐 **Account Support**\n\nI\'d be happy to help with your account issue!\n\n🔍 **I need your email address:**\n- Please provide the email associated with your account\n- This helps me verify your identity and access\n\n**Example:** "I can\'t log into john@email.com"\n\nOnce you provide your email, I can immediately assist with your account concern.',
-                        'validation': lambda x: bool(x and '@' in str(x))
-                    },
-                    {
-                        'entity': 'account_issue',
-                        'ask': lambda data: f'✅ **Email Received: {data.get("email", "your account")}**\n\nGreat! Now I need to know the specific account issue:\n\n🔍 **What account problem are you experiencing?**\n- Can\'t log in\n- Forgot password\n- Account locked\n- Need to update profile\n- Two-factor authentication issue\n- Other account concern\n\n**Examples:**\n- "I forgot my password"\n- "My account is locked after too many failed attempts"\n- "I need to update my email address"\n\nOnce you describe the issue, I can assist you and create a support ticket if needed.',
-                        'validation': lambda x: bool(x and str(x).strip())
-                    }
-                ],
-                'finalize': lambda data: self._finalize_account_flow(data)
-            }
-        }
-        
-        self.analytics = {
-            'total_queries': 0,
-            'total_tickets': 0,
-            'intent_distribution': defaultdict(int),
-            'avg_response_time': 0.0,
-            'entity_extraction_rate': 0.0,
-            'response_times': []
-        }
-        
-        # Intent patterns with better coverage
-        self.intent_patterns = {
-            'greeting': ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'morning', 'afternoon', 'evening'],
-            'billing': ['bill', 'charge', 'payment', 'invoice', 'money', 'cost', 'fee', 'billing'],
-            'technical': ['bug', 'error', 'crash', 'not working', 'broken', 'issue', 'problem', 'technical'],
-            'account': ['login', 'password', 'account', 'profile', 'sign in', 'access', 'account'],
-            'shipping': ['shipping', 'delivery', 'tracking', 'package', 'arrived', 'late', 'delayed', 'shipping', 'delivery'],
-            'return': ['return', 'exchange', 'cancel', 'refund', 'send back', 'want to return', 'need to return', 'return an order', 'need refund', 'want refund'],
-            'complaint': ['complaint', 'unhappy', 'disappointed', 'terrible', 'awful', 'bad'],
-            'off_topic': ['sandwich', 'recipe', 'cooking', 'food', 'weather', 'sports', 'politics']
-        }
-        
-        # Entity patterns
-        self.entity_patterns = {
-            'email': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-            'order_id': r'\b[A-Z]{2,3}-\d{3,6}\b|\b\d{3,8}\b',  # Also match simple numeric IDs (3-8 digits)
-            'phone': r'\b\d{3}-\d{3}-\d{4}\b|\b\(\d{3}\)\s*\d{3}-\d{4}\b',
-            'amount': r'\$\d+(?:\.\d{2})?',
-            'date': r'\b\d{1,2}\/\d{1,2}\/\d{2,4}\b|\b\d{1,2}-\d{1,2}-\d{2,4}\b',
-            'product': r'\b(sunscreen|cream|soap|lotion|shampoo|makeup|cosmetic|aqualogica)\b'
-        }
-        
-        self.initialize_system()
-    
-    # Helper method for generating ticket IDs
-    def make_ticket_id(self):
-        return f"TKT-{uuid.uuid4().hex[:8].upper()}"
-    
-    # DST Flow Engine Methods
-    def normalize_intent(self, raw_text: str) -> Union[str, None]:
-        """Normalize intent with typo handling using difflib"""
-        t = raw_text.lower().strip()
-        
-        # Quick patches for common typos
-        quick_map = {"redund": "refund", "refnd": "refund", "reund": "refund", "shippng": "shipping", "delivry": "delivery"}
-        for k, v in quick_map.items():
-            if k in t:
-                t = t.replace(k, v)
-        
-        # Try exact hit first
-        for intent, vocab in self.intent_canonical.items():
-            if any(word in t for word in vocab):
-                return intent
-        
-        # Fuzzy: best approximate across all canonical words
-        best_score, best_intent = 0.0, None
-        for intent, vocab in self.intent_canonical.items():
-            for word in vocab:
-                s = SequenceMatcher(None, t, word).ratio()
-                if s > best_score:
-                    best_score, best_intent = s, intent
-        
-        return best_intent if best_score >= 0.65 else None
-    
-    def _is_flow_active(self, conv_id: str) -> bool:
-        """Check if a flow is active for this conversation"""
-        return conv_id in self.user_states
-    
-    def _active_flow(self, conv_id: str) -> Union[str, None]:
-        """Get the active flow for this conversation"""
-        return self.user_states.get(conv_id, {}).get("flow")
-    
-    def _start_or_resume_flow(self, conv_id: str, intent: str, entities: Dict) -> str:
-        """Start or resume a flow, attempt to fill slots from provided entities"""
-        # Ensure flow state exists
-        if conv_id not in self.user_states or self.user_states[conv_id].get("flow") != intent:
-            self.user_states[conv_id] = {"flow": intent, "step": 0, "data": {}, "started_at": time.time()}
-        
-        # Try to fill slots from provided entities
-        state = self.user_states[conv_id]
-        flow_config = self.flows[intent]
-        current_step = state["step"]
-        
-        if current_step >= len(flow_config["required_slots"]):
-            # All slots filled, finalize
-            msg = flow_config["finalize"](state["data"])
-            self.user_states.pop(conv_id, None)
-            return msg
-        
-        # Check if current required slot can be filled from entities
-        required_slot = flow_config["required_slots"][current_step]["key"]
-        if required_slot in entities:
-            state["data"][required_slot] = entities[required_slot]
-            state["step"] += 1
-            # Recursively check if we can fill more slots
-            return self._start_or_resume_flow(conv_id, intent, entities)
-        
-        # Return the question for the current required slot
-        ask_msg = flow_config["required_slots"][current_step]["ask"]
-        if callable(ask_msg):
-            return ask_msg(state["data"])
-        else:
-            return ask_msg
-    
-    def _handle_flow_turn(self, conv_id: str, query: str, entities: Dict) -> str:
-        """Process a turn within an active flow, extract entities to fill next required slot"""
-        state = self.user_states.get(conv_id)
-        if not state:
-            return "Internal error: no active flow."
-        
-        flow_name = state["flow"]
-        flow_config = self.flows[flow_name]
-        current_step = state["step"]
-        
-        if current_step >= len(flow_config["required_slots"]):
-            # All slots filled, finalize
-            msg = flow_config["finalize"](state["data"])
-            self.user_states.pop(conv_id, None)
-            return msg
-        
-        required_slot = flow_config["required_slots"][current_step]["key"]
-        ask_msg = flow_config["required_slots"][current_step]["ask"]
-        
-        # Try to fill slot from entities
-        if required_slot in entities:
-            state["data"][required_slot] = entities[required_slot]
-            state["step"] += 1
-            # Recursively check if we can fill more slots
-            return self._handle_flow_turn(conv_id, query, entities)
-        
-        # Try to extract slot from user text using heuristics
-        query_lower = query.lower().strip()
-        
-        if required_slot == "resolution":
-            if "refund" in query_lower:
-                state["data"]["resolution"] = "refund"
-                state["step"] += 1
-                return self._handle_flow_turn(conv_id, query, entities)
-            elif any(word in query_lower for word in ["replace", "replacement", "exchange"]):
-                state["data"]["resolution"] = "replacement"
-                state["step"] += 1
-                return self._handle_flow_turn(conv_id, query, entities)
-        
-        elif required_slot == "reason":
-            # Map common reasons
-            reason_map = {
-                "damaged": "damaged", "defect": "damaged", "broken": "damaged",
-                "wrong": "wrong item", "incorrect": "wrong item",
-                "size": "size issue", "fit": "size issue",
-                "changed": "changed mind", "mind": "changed mind",
-                "other": "other"
-            }
-            for keyword, reason in reason_map.items():
-                if keyword in query_lower:
-                    state["data"]["reason"] = reason
-                    state["step"] += 1
-                    return self._handle_flow_turn(conv_id, query, entities)
-            
-            # If no specific reason found, treat the whole text as reason
-            if len(query_lower) >= 3:
-                state["data"]["reason"] = query.strip()
-                state["step"] += 1
-                return self._handle_flow_turn(conv_id, query, entities)
-        
-        # If we got here, we still need that slot → ask for it
-        if callable(ask_msg):
-            return ask_msg(state["data"])
-        else:
-            return ask_msg
-    
-    def _reset_flow(self, conv_id: str):
-        """Clear the state for a specific conversation ID"""
-        self.user_states.pop(conv_id, None)
-    
-    # DST Finalization Methods
-    def _finalize_return_flow_dst(self, data: Dict) -> str:
-        """Finalize return flow and create support ticket"""
-        ticket_id = self.make_ticket_id()
-        order_id = data.get("order_id", "your order")
-        reason = data.get("reason", "your return reason")
-        resolution = data.get("resolution", "your preference")
-        
-        return f"""🎫 **Return Request Completed!**
+# Clarification thresholds
+RETRIEVAL_MIN_SCORE = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.3"))
+ANSWER_MIN_CONFIDENCE = float(os.getenv("ANSWER_MIN_CONFIDENCE", "0.35"))
 
-✅ **Support Ticket Created**
-Ticket ID: {ticket_id}
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
 
-📋 **Return Details:**
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: {resolution}
+# Keys
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-📧 **Next Steps:**
-Our returns team will process your request within 24-48 hours. You'll receive an email confirmation with return shipping instructions.
+# Create directories
+Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+Path(INDEX_DIR).mkdir(parents=True, exist_ok=True)
 
-Thank you for your patience!"""
-    
-    def _finalize_shipping_flow_dst(self, data: Dict) -> str:
-        """Finalize shipping flow and create support ticket"""
-        ticket_id = self.make_ticket_id()
-        order_id = data.get("order_id", "your order")
-        shipping_issue = data.get("shipping_issue", "your shipping concern")
-        
-        return f"""🎫 **Shipping Support Ticket Created!**
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(Path(LOG_DIR) / f"{APP_NAME}.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger(APP_NAME)
 
-✅ **Support Ticket Created**
-Ticket ID: {ticket_id}
+# ------------------------------
+# Utility helpers
+# ------------------------------
 
-📋 **Shipping Details:**
-- Order ID: {order_id}
-- Issue: {shipping_issue}
+ISO_8601 = "%Y-%m-%dT%H:%M:%SZ"
 
-📧 **Next Steps:**
-Our shipping team will investigate and get back to you within 2-4 hours with tracking updates or resolution.
+def utcnow_str() -> str:
+    try:
+        # Python 3.11+
+        return datetime.now(datetime.UTC).strftime(ISO_8601)
+    except AttributeError:
+        # Python 3.8-3.10
+        return datetime.utcnow().strftime(ISO_8601)
 
-Thank you for your patience!"""
-    
-    def _finalize_billing_flow_dst(self, data: Dict) -> str:
-        """Finalize billing flow and create support ticket"""
-        ticket_id = self.make_ticket_id()
-        order_id = data.get("order_id", "your order")
-        billing_issue = data.get("billing_issue", "your billing concern")
-        
-        return f"""🎫 **Billing Support Ticket Created!**
 
-✅ **Support Ticket Created**
-Ticket ID: {ticket_id}
+def sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
-📋 **Billing Details:**
-- Order ID: {order_id}
-- Issue: {billing_issue}
 
-📧 **Next Steps:**
-Our billing team will investigate and resolve this within 24-48 hours. You'll receive an email confirmation.
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
 
-Thank you for your patience!"""
-    
-    def _finalize_technical_flow_dst(self, data: Dict) -> str:
-        """Finalize technical support flow and create support ticket"""
-        ticket_id = self.make_ticket_id()
-        issue_description = data.get("issue_description", "your technical issue")
-        device_info = data.get("device_info", "your device information")
-        
-        return f"""🎫 **Technical Support Ticket Created!**
 
-✅ **Support Ticket Created**
-Ticket ID: {ticket_id}
+# ------------------------------
+# Data structures
+# ------------------------------
 
-📋 **Technical Details:**
-- Issue: {issue_description}
-- Device: {device_info}
+@dataclass
+class DocChunk:
+    doc_id: str
+    chunk_id: str
+    text: str
+    source: str
+    page: Optional[int] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
 
-📧 **Next Steps:**
-Our technical team will review your issue and get back to you within 4-6 hours with troubleshooting steps or escalation.
 
-Thank you for your patience!"""
-    
-    def _finalize_account_flow_dst(self, data: Dict) -> str:
-        """Finalize account support flow and create support ticket"""
-        ticket_id = self.make_ticket_id()
-        email = data.get("email", "your account")
-        account_issue = data.get("account_issue", "your account concern")
-        
-        return f"""🎫 **Account Support Ticket Created!**
+@dataclass
+class RetrievalResult:
+    chunk: DocChunk
+    score: float
+    rank: int
+    method: str  # "semantic" or "bm25" or "rerank"
 
-✅ **Support Ticket Created**
-Ticket ID: {ticket_id}
 
-📋 **Account Details:**
-- Email: {email}
-- Issue: {account_issue}
+@dataclass
+class ChatTurn:
+    role: str  # user|assistant|system
+    content: str
+    timestamp: str
 
-📧 **Next Steps:**
-Our account team will assist you within 2-4 hours. You'll receive an email with instructions or resolution.
 
-Thank you for your patience!"""
-    
-    def initialize_system(self):
-        """Initialize the RAG system"""
-        try:
-            logger.info("Initializing RAG system...")
-            
-            # Create data directory if it doesn't exist
-            os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
-            
-            # Load knowledge base
-            self.load_knowledge_base()
-            
-            # Create embeddings and vector index
-            if self.knowledge_base:
-                if self.cohere_client:
-                    self.create_embeddings()
-                    logger.info("RAG system initialized successfully")
-                else:
-                    logger.warning("Cohere client not available - RAG system will not function properly")
-            else:
-                logger.warning("No knowledge base loaded - creating sample data")
-                self.create_sample_knowledge_base()
-                
-        except Exception as e:
-            logger.error(f"Error initializing system: {e}")
-    
-    def load_knowledge_base(self):
-        """Load PDF knowledge base"""
-        try:
-            # Debug: Log the upload folder path
-            logger.info(f"Looking for PDF files in: {os.path.abspath(Config.UPLOAD_FOLDER)}")
-            
-            # Debug: List ALL files in the directory
-            all_files = os.listdir(Config.UPLOAD_FOLDER)
-            logger.info(f"All files in directory: {all_files}")
-            
-            pdf_files = [f for f in all_files if f.endswith('.pdf')]
-            logger.info(f"PDF files found: {pdf_files}")
-            
-            if not pdf_files:
-                logger.warning(f"No PDF files found in {Config.UPLOAD_FOLDER}/ directory")
-                logger.warning(f"Directory contents: {all_files}")
-                return
-            
-            for pdf_file in pdf_files:
-                pdf_path = os.path.join(Config.UPLOAD_FOLDER, pdf_file)
-                logger.info(f"Loading PDF: {pdf_file}")
-                
-                with open(pdf_path, 'rb') as file:
-                    reader = PyPDF2.PdfReader(file)
-                    
-                    for page_num, page in enumerate(reader.pages):
-                        text = page.extract_text()
-                        if text.strip():
-                            # Split into chunks
-                            chunks = self.split_text_into_chunks(text, chunk_size=500)
-                            for chunk_num, chunk in enumerate(chunks):
-                                self.knowledge_base.append({
-                                    'source': pdf_file,
-                                    'page': page_num + 1,
-                                    'chunk': chunk_num + 1,
-                                    'content': chunk.strip()
-                                })
-            
-            logger.info(f"Loaded {len(self.knowledge_base)} chunks from {len(pdf_files)} PDF(s)")
-            
-        except Exception as e:
-            logger.error(f"Error loading knowledge base: {e}")
-    
-    def create_sample_knowledge_base(self):
-        """Create sample knowledge base for demonstration"""
-        sample_data = [
-            {
-                'source': 'sample_kb.txt',
-                'page': 1,
-                'chunk': 1,
-                'content': '''
-                Billing and Payment Information:
-                - All charges are processed within 24-48 hours of purchase
-                - Refunds typically take 3-5 business days to appear on your statement
-                - If you see duplicate charges, contact our billing department immediately
-                - We accept all major credit cards and PayPal
-                - Monthly subscription fees are charged on the same date each month
-                '''
-            },
-            {
-                'source': 'sample_kb.txt',
-                'page': 1,
-                'chunk': 2,
-                'content': '''
-                Technical Support Guidelines:
-                - Clear your browser cache if experiencing loading issues
-                - Check your internet connection for connectivity problems
-                - Try logging out and logging back in for account-related issues
-                - Update your browser to the latest version
-                - Disable browser extensions if experiencing compatibility issues
-                '''
-            },
-            {
-                'source': 'sample_kb.txt',
-                'page': 1,
-                'chunk': 3,
-                'content': '''
-                Account Management:
-                - Password reset links are valid for 24 hours
-                - Account lockouts occur after 5 failed login attempts
-                - Two-factor authentication is required for all accounts
-                - Profile information can be updated in account settings
-                - Account deletion requests are processed within 30 days
-                '''
-            },
-            {
-                'source': 'sample_kb.txt',
-                'page': 2,
-                'chunk': 1,
-                'content': '''
-                Shipping and Delivery Information:
-                - Standard shipping takes 5-7 business days
-                - Express shipping takes 2-3 business days
-                - Free shipping is available on orders over $50
-                - Tracking numbers are provided within 24 hours of shipment
-                - International shipping is available to most countries
-                '''
-            },
-            {
-                'source': 'sample_kb.txt',
-                'page': 2,
-                'chunk': 2,
-                'content': '''
-                Returns and Exchanges:
-                - Items can be returned within 30 days of purchase
-                - Original packaging is required for all returns
-                - Return shipping is free for defective items
-                - Exchanges can be processed online or by phone
-                - Refunds are issued to the original payment method
-                '''
-            }
-        ]
-        
-        self.knowledge_base = sample_data
-        self.create_embeddings()
-        logger.info(f"Created sample knowledge base with {len(self.knowledge_base)} chunks")
-    
-    def split_text_into_chunks(self, text: str, chunk_size: int = 500) -> List[str]:
-        """Split text into overlapping chunks"""
-        words = text.split()
-        chunks = []
-        
-        for i in range(0, len(words), chunk_size):
-            chunk = ' '.join(words[i:i + chunk_size])
-            chunks.append(chunk)
-        
-        return chunks
-    
-    def create_embeddings(self):
-        """Create embeddings for knowledge base using Cohere"""
-        try:
-            if not self.knowledge_base:
-                logger.warning("No knowledge base to create embeddings for")
-                return
-            
-            logger.info("Creating embeddings with Cohere...")
-            
-            # Extract text content
-            texts = [chunk['content'] for chunk in self.knowledge_base]
-            
-            # Create embeddings using Cohere
-            if not self.cohere_client:
-                logger.error("Cohere client not available - cannot create embeddings")
-                return
-                
-            response = self.cohere_client.embed(
-                texts=texts,
-                model='embed-english-v3.0',
-                input_type='search_document'
-            )
-            
-            # Convert to numpy array
-            self.embeddings = np.array(response.embeddings, dtype=np.float32)
-            
-            # Create simple vector index using numpy
-            dimension = self.embeddings.shape[1]
-            self.vector_index = self.embeddings.copy()
-            
-            # Normalize embeddings for cosine similarity
-            norms = np.linalg.norm(self.vector_index, axis=1, keepdims=True)
-            self.vector_index = self.vector_index / norms
-            
-            logger.info(f"Created vector index with {len(self.embeddings)} embeddings (dimension: {dimension})")
-            
-        except Exception as e:
-            logger.error(f"Error creating embeddings: {e}")
-    
-    def extract_entities(self, text: str, conversation_context: List[Dict] = None, conversation_id: str = None) -> Dict[str, str]:
-        """Extract entities from text using regex patterns with conversation context and state"""
-        entities = {}
-        
-        # Skip entity extraction for obvious greetings (performance optimization)
-        text_lower = text.lower().strip()
-        if text_lower in ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening']:
-            return entities
-        
-        # Extract entities from current text ONLY
-        for entity_type, pattern in self.entity_patterns.items():
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                entities[entity_type] = matches[0] if len(matches) == 1 else matches
-                logger.info(f"Extracted {entity_type} entity: {entities[entity_type]}")
-            else:
-                logger.info(f"No {entity_type} entity found in text: '{text}'")
-        
-        # Extract product entities from text ONLY
-        product_keywords = ['sunscreen', 'cream', 'soap', 'lotion', 'shampoo', 'makeup', 'cosmetic', 'aqualogica']
-        text_lower = text.lower()
-        logger.info(f"Checking for product keywords in: '{text_lower}'")
-        for keyword in product_keywords:
-            if keyword.lower() in text_lower:
-                entities['product'] = keyword
-                logger.info(f"Extracted product entity: {keyword}")
+@dataclass
+class ChatState:
+    history: List[ChatTurn] = field(default_factory=list)
+    summary: str = ""
+    token_estimate: int = 0
+    slots: Dict[str, Any] = field(default_factory=lambda: {
+        "order_id": None,
+        "purchase_date": None,
+        "product_name": None,
+        "issue_type": None,
+        "issue_description": None,
+        "additional_info": None,
+        "email": None,
+        "amount": None
+    })
+    ticket_created: bool = False
+    conversation_stage: str = "greeting"  # greeting, collecting_info, resolved
+
+
+# ------------------------------
+# Lightweight token estimator (character heuristic)
+# ------------------------------
+
+def estimate_tokens(text: str) -> int:
+    # Approximation: 1 token ~= 4 chars for English text
+    return max(1, math.ceil(len(text) / 4))
+
+
+# ------------------------------
+# Document loading & chunking
+# ------------------------------
+
+SUPPORTED_EXTS = ["*.txt", "*.md", "*.markdown", "*.csv", "*.pdf"]
+
+
+def discover_files(data_dir: str) -> List[Path]:
+    root = Path(data_dir)
+    files: List[Path] = []
+    if not root.exists():
+        return files
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        for pat in SUPPORTED_EXTS:
+            if fnmatch.fnmatch(p.name.lower(), pat):
+                files.append(p)
                 break
-        
-        # Enhance with entities from conversation context if available
-        if conversation_context and len(conversation_context) > 0:
-            for msg in conversation_context[-3:]:  # Last 3 messages
-                if msg.get('entities'):
-                    for entity_type, value in msg['entities'].items():
-                        # Only add if not already present in current entities
-                        if entity_type not in entities:
-                            entities[entity_type] = value
-                            logger.info(f"Added entity from context: {entity_type}: {value}")
-        
-        # ONLY enhance with conversation state if we're in an ongoing conversation (more than 1 message)
-        if conversation_id and conversation_id in self.conversation_state:
-            state = self.conversation_state[conversation_id]
-            conversation_length = len(self.conversation_history.get(conversation_id, []))
-            
-            # Only use state entities if we have an ongoing conversation
-            if conversation_length > 1:
-                for key in ['order_id', 'product', 'return_reason']:
-                    if key in state and key not in entities and state[key] is not None:
-                        entities[key] = state[key]
-                        logger.info(f"Added entity from state: {key}: {state[key]}")
-        
-        return entities
-    
-    def classify_intent(self, text: str, entities: Dict = None) -> tuple:
-        """Classify user intent based on keywords and entities with improved logic"""
-        text_lower = text.lower()
-        
-        # Fuzzy matching for common typos and variations
-        fuzzy_patterns = {
-            'return': ['refund', 'return', 'exchange', 'redund', 'refun', 'retun', 'exchnge', 'exchage'],
-            'shipping': ['delivery', 'shipping', 'package', 'tracking', 'shippng', 'delivry', 'packge'],
-            'billing': ['bill', 'charge', 'payment', 'billing', 'bil', 'chage', 'paymnt'],
-            'account': ['password', 'login', 'account', 'profile', 'sign in', 'access', 'acount', 'logn'],
-            'technical': ['bug', 'error', 'crash', 'not working', 'broken', 'issue', 'problem', 'technical', 'tech', 'workng']
-        }
-        
-        # Check for fuzzy matches first
-        for intent, patterns in fuzzy_patterns.items():
-            for pattern in patterns:
-                if pattern in text_lower:
-                    return intent, 0.9
-        
-        # Special handling for common patterns with high confidence
-        if any(word in text_lower for word in ['delivery', 'shipping', 'package', 'tracking']):
-            return 'shipping', 0.9
-        
-        if any(word in text_lower for word in ['refund', 'return', 'exchange']):
-            return 'return', 0.9
-        
-        if any(word in text_lower for word in ['password', 'login', 'account']):
-            return 'account', 0.9
-        
-        if any(word in text_lower for word in ['bill', 'charge', 'payment', 'billing']):
-            return 'billing', 0.9
-        
-        # General pattern matching
-        intent_scores = {}
-        for intent, keywords in self.intent_patterns.items():
-            score = sum(1 for keyword in keywords if keyword in text_lower)
-            if score > 0:
-                intent_scores[intent] = score
-        
-        # Boost confidence for e-commerce entities
-        if entities:
-            if 'order_id' in entities and 'product' in entities:
-                # High confidence for return/shipping when we have order + product
-                if 'return' in text_lower or 'exchange' in text_lower:
-                    return 'return', 0.9
-                elif 'shipping' in text_lower or 'delivery' in text_lower:
-                    return 'shipping', 0.9
-                else:
-                    return 'general', 0.8  # High confidence for e-commerce context
-        
-        if intent_scores:
-            best_intent = max(intent_scores, key=intent_scores.get)
-            confidence = intent_scores[best_intent] / len(self.intent_patterns[best_intent])
-            
-            # Special case: Greetings should have high confidence
-            if best_intent == 'greeting':
-                return 'greeting', 0.9
-            
-            # Boost confidence for clear matches
-            if confidence > 0.5:
-                confidence = min(confidence + 0.3, 1.0)
-            
-            return best_intent, min(confidence, 1.0)
-        
-        # Check for off-topic queries
-        if not self.is_ecommerce_related(text):
-            return 'off_topic', 0.1
-        
-        return 'general', 0.3
-    
-    def search_knowledge_base(self, query: str, top_k: int = 3, conversation_context: List[Dict] = None) -> List[Dict]:
-        """Search knowledge base using vector similarity with conversation context"""
+    return files
+
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+
+def load_pdf(path: Path) -> str:
+    if fitz is None:
+        logger.warning("PyMuPDF not installed; cannot parse PDF: %s", path)
+        return ""
+    try:
+        doc = fitz.open(str(path))
+        texts = []
+        for page in doc:
+            texts.append(page.get_text("text"))
+        return "\n".join(texts)
+    except Exception as e:
+        logger.exception("PDF parse failed for %s: %s", path, e)
+        return ""
+
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks: List[str] = []
+    i = 0
+    while i < len(text):
+        chunk = text[i : i + chunk_size]
+        chunks.append(chunk)
+        i += max(1, chunk_size - overlap)
+    return chunks
+
+
+def build_corpus(data_dir: str) -> List[DocChunk]:
+    files = discover_files(data_dir)
+    corpus: List[DocChunk] = []
+    for fp in files:
+        raw = ""
+        if fp.suffix.lower() == ".pdf":
+            raw = load_pdf(fp)
+        else:
+            raw = read_text(fp)
+        if not raw.strip():
+            continue
+        doc_id = sha1(str(fp.resolve()))
+        chunks = chunk_text(raw)
+        for idx, ch in enumerate(chunks):
+            corpus.append(
+                DocChunk(
+                    doc_id=doc_id,
+                    chunk_id=f"{doc_id}-{idx}",
+                    text=ch,
+                    source=str(fp),
+                    page=None,
+                    meta={"filename": fp.name},
+                )
+            )
+    logger.info("Built corpus: %d chunks from %d files", len(corpus), len(files))
+    return corpus
+
+
+# ------------------------------
+# Embeddings + FAISS (semantic)
+# ------------------------------
+
+class EmbeddingBackend:
+    def __init__(self, provider: str = EMBEDDING_PROVIDER, model: str = EMBEDDING_MODEL):
+        self.provider = provider
+        self.model = model
+        self._setup()
+
+    def _setup(self):
+        self.client = None
+        if self.provider == "cohere":
+            try:
+                import cohere
+                self.client = cohere.Client(COHERE_API_KEY)
+            except Exception:
+                logger.exception("Cohere client init failed")
+        elif self.provider == "openai":
+            try:
+                from openai import OpenAI
+                self.client = OpenAI(api_key=OPENAI_API_KEY)
+            except Exception:
+                logger.exception("OpenAI client init failed")
+        elif self.provider == "sentence-transformers":
+            try:
+                # Fallback to Cohere if sentence-transformers not available
+                import cohere
+                self.client = cohere.Client(COHERE_API_KEY)
+                self.provider = "cohere"  # Switch to Cohere
+                self.model = "embed-multilingual-v3.0"  # Use Cohere model
+            except Exception:
+                logger.exception("SentenceTransformer fallback failed")
+        else:
+            logger.warning("Unknown embedding provider: %s", self.provider)
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        if self.provider == "cohere" and self.client:
+            resp = self.client.embed(texts=texts, model=self.model, input_type="search_query")
+            return [v for v in resp.embeddings]
+        elif self.provider == "openai" and self.client:
+            # Uses text-embedding-3-large/small style
+            out = []
+            for t in texts:
+                emb = self.client.embeddings.create(model=self.model, input=t).data[0].embedding
+                out.append(emb)
+            return out
+        elif self.provider == "sentence-transformers" and self.client:
+            # This should not happen now as we fallback to Cohere
+            return self.client.encode(texts, normalize_embeddings=True).tolist()
+        else:
+            # Fallback: random vectors (for dev only)
+            logger.warning("Embedding fallback to random vectors; set proper provider & key.")
+            dim = 384
+            return [[random.random() for _ in range(dim)] for _ in texts]
+
+
+class FAISSIndex:
+    def __init__(self, dim: int = 384, index_dir: str = INDEX_DIR):
+        self.dim = dim
+        self.index_dir = Path(index_dir)
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.id2chunk: Dict[int, DocChunk] = {}
+        self.faiss = None
+
+    def build(self, chunks: List[DocChunk], embedder: EmbeddingBackend):
         try:
-            # Memory safety check
-            if self.vector_index is None or self.knowledge_base is None or len(self.knowledge_base) == 0:
-                logger.warning("Knowledge base not initialized - returning empty results")
-                return []
-            
-            # Limit query length to prevent memory issues
-            if len(query) > 1000:
-                query = query[:1000]
-                logger.warning("Query truncated to prevent memory issues")
-            
-            # Enhance query with conversation context if available
-            enhanced_query = query
-            if conversation_context and len(conversation_context) > 0:
-                # Extract key information from recent messages
-                recent_queries = [msg.get('query', '') for msg in conversation_context[-3:]]  # Last 3 messages
-                recent_entities = []
-                for msg in conversation_context[-3:]:
-                    if msg.get('entities'):
-                        recent_entities.extend([f"{k}:{v}" for k, v in msg['entities'].items()])
-                
-                # Combine current query with context
-                context_text = " ".join(recent_queries + recent_entities)
-                enhanced_query = f"{query} {context_text}".strip()
-                logger.info(f"Enhanced query with context: {enhanced_query}")
-            
-            # Create query embedding
-            if not self.cohere_client:
-                logger.error("Cohere client not available - cannot create query embeddings")
-                return []
-                
-            response = self.cohere_client.embed(
-                texts=[enhanced_query],
-                model='embed-english-v3.0',
-                input_type='search_query'
+            import faiss
+        except Exception as e:
+            logger.error("FAISS import failed: %s", e)
+            raise
+        texts = [c.text for c in chunks]
+        vecs = embedder.embed(texts)
+        if not vecs:
+            raise RuntimeError("No embeddings produced.")
+        self.dim = len(vecs[0])
+        self.faiss = faiss.IndexFlatIP(self.dim)
+        import numpy as np
+        mat = np.array(vecs, dtype="float32")
+        # Normalize for cosine similarity via inner product
+        faiss.normalize_L2(mat)
+        self.faiss.add(mat)
+        self.id2chunk = {i: chunks[i] for i in range(len(chunks))}
+        self._save()
+        logger.info("FAISS built with %d vectors (dim=%d)", len(chunks), self.dim)
+
+    def _paths(self) -> Tuple[Path, Path]:
+        return (self.index_dir / "faiss.index", self.index_dir / "faiss_meta.json")
+
+    def _save(self):
+        if self.faiss is None:
+            return
+        import faiss
+        idx_path, meta_path = self._paths()
+        faiss.write_index(self.faiss, str(idx_path))
+        meta = {
+            "dim": self.dim,
+            "id2chunk": {str(i): dataclasses.asdict(c) for i, c in self.id2chunk.items()},
+        }
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    def load(self) -> bool:
+        try:
+            import faiss
+            idx_path, meta_path = self._paths()
+            if not idx_path.exists() or not meta_path.exists():
+                return False
+            self.faiss = faiss.read_index(str(idx_path))
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.dim = meta["dim"]
+            self.id2chunk = {int(i): DocChunk(**c) for i, c in meta["id2chunk"].items()}
+            logger.info("Loaded FAISS index with %d vectors", len(self.id2chunk))
+            return True
+        except Exception as e:
+            logger.exception("Failed to load FAISS: %s", e)
+            return False
+
+    def search(self, query: str, embedder: EmbeddingBackend, k: int = TOP_K) -> List[RetrievalResult]:
+        if self.faiss is None:
+            return []
+        import numpy as np
+        vec = embedder.embed([query])[0]
+        vec = np.array([vec], dtype="float32")
+        # Normalize
+        import faiss as _fa
+        _fa.normalize_L2(vec)
+        scores, idxs = self.faiss.search(vec, k)
+        results: List[RetrievalResult] = []
+        for rank, (score, idx) in enumerate(zip(scores[0], idxs[0])):
+            if idx == -1:
+                continue
+            results.append(
+                RetrievalResult(
+                    chunk=self.id2chunk.get(int(idx)),
+                    score=float(score),
+                    rank=rank + 1,
+                    method="semantic",
+                )
+            )
+        return results
+
+
+# ------------------------------
+# Simple BM25 (keyword) retriever
+# ------------------------------
+
+class BM25:
+    def __init__(self, docs: List[DocChunk], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.docs = docs
+        self.N = len(docs)
+        self.avgdl = 1.0
+        self.doc_freq: Dict[str, int] = collections.defaultdict(int)
+        self.doc_terms: List[List[str]] = []
+        self.doc_len: List[int] = []
+        self._build()
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return re.findall(r"[a-zA-Z0-9_]+", text.lower())
+
+    def _build(self):
+        for d in self.docs:
+            terms = self._tokenize(d.text)
+            self.doc_terms.append(terms)
+            self.doc_len.append(len(terms))
+            for t in set(terms):
+                self.doc_freq[t] += 1
+        self.avgdl = sum(self.doc_len) / max(1, self.N)
+
+    def score(self, qterms: List[str], doc_idx: int) -> float:
+        score = 0.0
+        terms = self.doc_terms[doc_idx]
+        tf = collections.Counter(terms)
+        dl = self.doc_len[doc_idx]
+        for t in qterms:
+            if t not in self.doc_freq:
+                continue
+            n = self.doc_freq[t]
+            idf = math.log(1 + (self.N - n + 0.5) / (n + 0.5))
+            freq = tf.get(t, 0)
+            score += idf * (freq * (self.k1 + 1)) / (freq + self.k1 * (1 - self.b + self.b * dl / self.avgdl))
+        return score
+
+    def search(self, query: str, k: int = TOP_K) -> List[RetrievalResult]:
+        qterms = self._tokenize(query)
+        scored: List[Tuple[int, float]] = []
+        for i, _ in enumerate(self.docs):
+            s = self.score(qterms, i)
+            if s > 0:
+                scored.append((i, s))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        results: List[RetrievalResult] = []
+        for rank, (idx, s) in enumerate(scored[:k]):
+            results.append(
+                RetrievalResult(chunk=self.docs[idx], score=float(s), rank=rank + 1, method="bm25")
+            )
+        return results
+
+
+# ------------------------------
+# Optional: Cross-encoder reranker
+# ------------------------------
+
+class Reranker:
+    def __init__(self, model_name: str = RERANK_MODEL):
+        self.model_name = model_name
+        self.enabled = RERANK_ENABLED
+        self.client = None
+        if self.enabled:
+            try:
+                import cohere
+                self.client = cohere.Client(COHERE_API_KEY)
+            except Exception:
+                logger.exception("Cohere reranker init failed; continuing without rerank.")
+                self.enabled = False
+
+    def rerank(self, query: str, candidates: List[RetrievalResult], top_k: int = TOP_K) -> List[RetrievalResult]:
+        if not self.enabled or not candidates:
+            return candidates[:top_k]
+        
+        try:
+            # Use Cohere rerank API
+            documents = [c.chunk.text for c in candidates]
+            response = self.client.rerank(
+                model=self.model_name,
+                query=query,
+                documents=documents,
+                top_n=len(documents)
             )
             
-            query_embedding = np.array(response.embeddings, dtype=np.float32)
+            # Create a mapping of document text to RetrievalResult
+            doc_to_result = {c.chunk.text: c for c in candidates}
             
-            # Normalize query embedding for cosine similarity
-            query_norm = np.linalg.norm(query_embedding)
-            if query_norm == 0:
-                logger.warning("Query embedding has zero norm - cannot normalize")
-                return []
+            # Reorder based on Cohere rerank results
+            out: List[RetrievalResult] = []
+            for rank, result in enumerate(response.results[:top_k]):
+                # Check if result.document exists and has text
+                if not result.document or not hasattr(result.document, 'text') or not result.document.text:
+                    continue
+                    
+                doc_text = result.document.text
+                original_result = doc_to_result.get(doc_text)
+                if original_result:
+                    out.append(
+                        RetrievalResult(
+                            chunk=original_result.chunk, 
+                            score=float(result.relevance_score), 
+                            rank=rank + 1, 
+                            method="rerank"
+                        )
+                    )
             
-            query_embedding = query_embedding / query_norm
+            # If Cohere rerank fails, return original candidates
+            if not out:
+                return candidates[:top_k]
             
-            # Search vector index using numpy (cosine similarity)
-            try:
-                similarities = np.dot(self.vector_index, query_embedding.T).flatten()
-            except Exception as e:
-                logger.error(f"Error calculating similarities: {e}")
-                return []
+            return out
             
-            # Ensure we have valid similarities before proceeding
-            if similarities is None or similarities.size == 0:
-                logger.warning("No similarities calculated - empty result")
-                return []
+        except Exception as e:
+            logger.exception("Cohere rerank failed: %s", e)
+            return candidates[:top_k]
+
+
+# ------------------------------
+# Hybrid retrieval orchestration
+# ------------------------------
+
+class HybridRetriever:
+    def __init__(self, faiss: FAISSIndex, bm25: BM25, embedder: EmbeddingBackend, weights: Tuple[float, float] = HYBRID_WEIGHTS):
+        self.faiss = faiss
+        self.bm25 = bm25
+        self.embedder = embedder
+        self.w_sem, self.w_kw = weights
+
+    def retrieve(self, query: str, top_k: int = TOP_K) -> List[RetrievalResult]:
+        sem = self.faiss.search(query, self.embedder, k=top_k * 3)  # over-fetch
+        kw = self.bm25.search(query, k=top_k * 3)
+        pool: Dict[str, RetrievalResult] = {}
+        # Merge with weighted score; unique by chunk_id
+        for r in sem:
+            cid = r.chunk.chunk_id
+            s = self.w_sem * r.score
+            if cid not in pool or s > pool[cid].score:
+                pool[cid] = RetrievalResult(chunk=r.chunk, score=s, rank=r.rank, method=r.method)
+        for r in kw:
+            cid = r.chunk.chunk_id
+            s = (pool.get(cid).score if cid in pool else 0.0) + self.w_kw * r.score
+            pool[cid] = RetrievalResult(chunk=r.chunk, score=s, rank=r.rank, method=r.method)
+        merged = sorted(pool.values(), key=lambda x: x.score, reverse=True)
+        return merged[: top_k * 2]
+
+
+# ------------------------------
+# LangExtract (structured extraction)
+# ------------------------------
+
+class StructuredExtractor:
+    def __init__(self):
+        self.available = False
+        self.Schema = None
+        self.GeminiLLM = None
+        self.OpenAILLM = None
+        
+        try:
+            # Try to import LangExtract components
+            import importlib.util
             
-            indices = np.argsort(similarities)[::-1][:top_k]  # Top k results
-            scores = similarities[indices]
-            
-            # Debug: Log the arrays
-            logger.info(f"Similarities shape: {similarities.shape}, type: {type(similarities)}")
-            logger.info(f"Indices shape: {indices.shape}, type: {type(indices)}")
-            logger.info(f"Scores shape: {scores.shape}, type: {type(scores)}")
-            
-            results = []
-            # Ensure both arrays are 1D and have the same length
-            if indices is not None and scores is not None and len(scores) == len(indices) and len(scores) > 0:
-                for i in range(len(scores)):
+            # Check if langextract is available
+            if importlib.util.find_spec("langextract"):
+                # Use string-based imports to avoid Pylance errors
+                import importlib
+                
+                # Import Schema
+                langextract_module = importlib.import_module("langextract")
+                self.Schema = getattr(langextract_module, "Schema", None)
+                
+                # Try to get LLM classes from different possible locations
+                self.GeminiLLM = None
+                self.OpenAILLM = None
+                
+                # Try newer integration paths
+                try:
+                    google_module = importlib.import_module("langextract.integrations.google")
+                    self.GeminiLLM = getattr(google_module, "Gemini", None)
+                except ImportError:
+                    pass
+                
+                try:
+                    openai_module = importlib.import_module("langextract.integrations.openai")
+                    self.OpenAILLM = getattr(openai_module, "OpenAI", None)
+                except ImportError:
+                    pass
+                
+                # Try older model_providers path
+                if not self.GeminiLLM or not self.OpenAILLM:
                     try:
-                        # Convert numpy types to Python types safely
-                        score = float(scores[i])
-                        idx = int(indices[i])
-                        
-                        # Validate index bounds
-                        if 0 <= idx < len(self.knowledge_base):
-                            result = self.knowledge_base[idx].copy()
-                            result['similarity_score'] = score
-                            results.append(result)
-                        else:
-                            logger.warning(f"Index {idx} out of bounds for knowledge base size {len(self.knowledge_base)}")
-                    except (ValueError, TypeError, IndexError) as e:
-                        logger.warning(f"Error processing result {i}: {e}")
-                        continue
-            else:
-                logger.error(f"Array length mismatch: scores={len(scores)}, indices={len(indices)}")
-                logger.error(f"Scores length: {len(scores)}, Indices length: {len(indices)}")
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error searching knowledge base: {e}")
-            return []
-    
-    def generate_response(self, query: str, context: List[Dict], intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> str:
-        """Generate response using DST flow engine to avoid infinite loops"""
-        try:
-            # Handle greetings first
-            if intent == 'greeting':
-                return """Hello! I'm your AI customer support assistant. I can help you with:
-
-🔐 Account and password issues
-💳 Billing and payment questions  
-🛠️ Technical support
-📦 Shipping and delivery
-🔄 Returns and refunds
-
-How can I assist you today?"""
-            
-            # DST FLOW ENGINE: Check if a flow is already active
-            if conversation_id and self._is_flow_active(conversation_id):
-                # Continue the active flow - NO reclassification
-                return self._handle_flow_turn(conversation_id, query, entities)
-            
-            # If no active flow, try to start one based on intent
-            if intent in self.flows:
-                return self._start_or_resume_flow(conversation_id, intent, entities)
-            
-            # If intent not in flows, try to normalize it
-            normalized_intent = self.normalize_intent(query)
-            if normalized_intent and normalized_intent in self.flows:
-                return self._start_or_resume_flow(conversation_id, normalized_intent, entities)
-            
-            # Fallback to RAG/KB answer if no flow matches
-            if context and len(context) > 0:
-                # Use knowledge base content
-                return self._generate_rag_response(query, context, intent, entities)
-            else:
-                # No KB content, provide guided menu
-                return """I can help you with: returns/refunds, shipping, billing, account, and tech support. 
-
-🔍 **Try one of these:**
-- "I want a refund" or "I need to return an item"
-- "Where is my order?" or "Track my package"
-- "I was charged twice" or "Payment issue"
-- "I can't log in" or "Password reset"
-- "App not working" or "Technical problem"
-
-What would you like help with today?"""
-            
-        except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _generate_rag_response(self, query: str, context: List[Dict], intent: str, entities: Dict) -> str:
-        """Generate response using RAG knowledge base content"""
-        try:
-            if not context or len(context) == 0:
-                return "I don't have specific information about that in my knowledge base. Would you like me to create a support ticket for you?"
-            
-            # Use the most relevant chunk
-            best_chunk = context[0]
-            content = best_chunk.get('content', '')
-            
-            # Generate a helpful response based on the content
-            if intent == 'shipping':
-                return f"""Based on my knowledge base, here's what I found about shipping:
-
-{content[:300]}...
-
-Would you like me to help you with a specific shipping issue? I can create a support ticket for you."""
-            
-            elif intent == 'return':
-                return f"""Based on my knowledge base, here's what I found about returns:
-
-{content[:300]}...
-
-Would you like me to help you process a return? I can guide you through the process."""
-            
-            elif intent == 'billing':
-                return f"""Based on my knowledge base, here's what I found about billing:
-
-{content[:300]}...
-
-Would you like me to help you with a specific billing issue? I can create a support ticket for you."""
-            
-            else:
-                return f"""Here's what I found in my knowledge base:
-
-{content[:300]}...
-
-Is there anything specific I can help you with regarding this information?"""
+                        providers_module = importlib.import_module("langextract.model_providers")
+                        if not self.GeminiLLM:
+                            self.GeminiLLM = getattr(providers_module, "GeminiLLM", None)
+                        if not self.OpenAILLM:
+                            self.OpenAILLM = getattr(providers_module, "OpenAILLM", None)
+                    except ImportError:
+                        pass
                 
-        except Exception as e:
-            logger.error(f"Error generating RAG response: {e}")
-            return "I found some relevant information but I'm having trouble processing it. Would you like me to create a support ticket for you?"
-    
-    def _check_resolution_ready(self, intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> Dict:
-        """Check if we have enough information to resolve the issue"""
-        try:
-            # Get all entities from conversation context
-            context_entities = {}
-            if conversation_context and len(conversation_context) > 0:
-                for msg in conversation_context:
-                    if msg.get('entities'):
-                        for key, value in msg['entities'].items():
-                            if key not in context_entities:
-                                context_entities[key] = value
-            
-            # Merge with current entities
-            all_entities = {**context_entities, **entities}
-            
-            # Check if this is a resolution choice (final step)
-            if conversation_id and conversation_id in self.active_conversations:
-                conv_state = self.active_conversations[conversation_id]
-                locked_intent = conv_state['locked_intent']
+                if self.Schema:
+                    self.available = True
+                    logger.info("LangExtract loaded successfully for structured extraction.")
+                else:
+                    self.available = False
+                    logger.warning("LangExtract Schema not found")
+            else:
+                raise ImportError("langextract module not found")
                 
-                # Check if user is making a resolution choice
-                if locked_intent == 'return' and self._is_resolution_choice(entities, conversation_context):
-                    return {
-                        'can_resolve': True,
-                        'missing': [],
-                        'entities': all_entities,
-                        'intent': locked_intent,
-                        'is_resolution_choice': True
+        except ImportError:
+            logger.warning("LangExtract not available. Install google-langextract to enable structured extraction.")
+            self.available = False
+        except Exception as e:
+            logger.warning("LangExtract import failed: %s", e)
+            self.available = False
+        if self.available and self.Schema:
+            try:
+                self.schema = self.Schema.from_dict(
+                    {
+                        "order_id": "string: The customer order number if present",
+                        "issue_type": "string: refund_request | shipping_delay | damaged_item | billing_issue | account_issue | general",
+                        "product": "string: Product or SKU if present",
+                        "email": "string: Email if present",
+                        "amount": "string: Monetary amount if present",
+                        "date": "string: Date if present (ISO or natural language)",
                     }
-            
-            # Define resolution requirements for each intent
-            resolution_requirements = {
-                'shipping': {
-                    'required': ['order_id'],
-                    'optional': ['product', 'delivery_date'],
-                    'can_resolve': lambda e: 'order_id' in e
-                },
-                'return': {
-                    'required': ['order_id', 'reason'],
-                    'optional': ['product', 'damage_description'],
-                    'can_resolve': lambda e: 'order_id' in e and 'reason' in e
-                },
-                'billing': {
-                    'required': ['order_id', 'billing_issue'],
-                    'optional': ['amount', 'date'],
-                    'can_resolve': lambda e: 'order_id' in e and 'billing_issue' in e
-                },
-                'technical': {
-                    'required': ['issue_description'],
-                    'optional': ['device', 'browser'],
-                    'can_resolve': lambda e: 'issue_description' in e
-                },
-                'account': {
-                    'required': ['email', 'account_issue'],
-                    'optional': ['username', 'last_login'],
-                    'can_resolve': lambda e: 'email' in e and 'account_issue' in e
-                }
-            }
-            
-            if intent not in resolution_requirements:
-                return {'can_resolve': False, 'missing': [], 'entities': all_entities}
-            
-            req = resolution_requirements[intent]
-            can_resolve = req['can_resolve'](all_entities)
-            
-            # Find missing required fields
-            missing = [field for field in req['required'] if field not in all_entities]
-            
-            return {
-                'can_resolve': can_resolve,
-                'missing': missing,
-                'entities': all_entities,
-                'intent': intent,
-                'is_resolution_choice': False
-            }
-            
-        except Exception as e:
-            logger.error(f"Error checking resolution readiness: {e}")
-            return {'can_resolve': False, 'missing': [], 'entities': {}, 'intent': intent}
-    
-    def _is_resolution_choice(self, entities: Dict, conversation_context: List[Dict] = None) -> bool:
-        """Check if the user is making a resolution choice (refund/replacement)"""
+                )
+                logger.info("LangExtract schema created successfully")
+            except Exception as e:
+                logger.warning("Failed to create LangExtract schema: %s", e)
+                self.available = False
+                self.schema = None
+
+    def extract(self, text: str) -> Dict[str, Any]:
+        # Always fallback to regex extraction if LangExtract is not available
+        if not self.available or not hasattr(self, 'schema') or not self.schema:
+            return naive_entity_extract(text)
+        
         try:
-            # Check for resolution choice keywords
-            resolution_keywords = ['refund', 'replacement', 'exchange', 'money back', 'new item', 'different item']
+            # Check if run_extraction is available
+            import importlib.util
+            if not importlib.util.find_spec("langextract"):
+                return naive_entity_extract(text)
+                
+            # Use string-based import to avoid Pylance errors
+            import importlib
+            langextract_module = importlib.import_module("langextract")
+            run_extraction = getattr(langextract_module, "run_extraction", None)
             
-            # Get text from conversation context
-            if conversation_context and len(conversation_context) > 0:
-                latest_message = conversation_context[-1].get('query', '').lower()
-                if any(keyword in latest_message for keyword in resolution_keywords):
-                    return True
+            if not run_extraction:
+                return naive_entity_extract(text)
             
-            # Check current entities for resolution choice
-            if 'refund' in str(entities).lower() or 'replacement' in str(entities).lower():
-                return True
+            llm = None
             
-            return False
+            # Try to create LLM instance if available
+            if (LLM_PROVIDER == "gemini" and GEMINI_API_KEY and 
+                hasattr(self, 'GeminiLLM') and self.GeminiLLM):
+                try:
+                    # Try different initialization patterns
+                    try:
+                        llm = self.GeminiLLM(model=LLM_MODEL)
+                    except TypeError:
+                        # Some versions expect different parameters
+                        llm = self.GeminiLLM()
+                except Exception:
+                    pass
+            elif (LLM_PROVIDER == "openai" and OPENAI_API_KEY and 
+                  hasattr(self, 'OpenAILLM') and self.OpenAILLM):
+                try:
+                    try:
+                        llm = self.OpenAILLM(model=LLM_MODEL)
+                    except TypeError:
+                        llm = self.OpenAILLM()
+                except Exception:
+                    pass
             
-        except Exception as e:
-            logger.error(f"Error checking resolution choice: {e}")
-            return False
-    
-    def _generate_resolution_response(self, intent: str, resolution_result: Dict, conversation_context: List[Dict] = None) -> str:
-        """Generate resolution response when we have enough information"""
-        try:
-            entities = resolution_result['entities']
-            intent = resolution_result['intent']
-            
-            if intent == 'shipping':
-                order_id = entities.get('order_id', 'your order')
-                return f"""✅ **Shipping Issue Resolved!**
-
-I have all the information I need to help with your shipping concern for order {order_id}.
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Issue: Shipping inquiry for order {order_id}
-- Priority: Normal
-
-Our shipping team will review your order and contact you within 2 hours with:
-- Current shipping status
-- Tracking information
-- Estimated delivery date
-- Any necessary actions
-
-Is there anything else I can help you with today?"""
-            
-            elif intent == 'return':
-                order_id = entities.get('order_id', 'your order')
-                product = entities.get('product', 'the item')
-                return f"""✅ **Return Request Processed!**
-
-I have all the information needed for your return request:
-- Order ID: {order_id}
-- Product: {product}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Return request
-- Priority: High
-
-Our returns team will contact you within 2 hours to:
-- Confirm return details
-- Provide return shipping label
-- Process your refund/replacement
-- Arrange pickup if needed
-
-Is there anything else I can help you with today?"""
-            
-            elif intent == 'billing':
-                order_id = entities.get('order_id', 'your order')
-                return f"""✅ **Billing Issue Addressed!**
-
-I have your order ID: {order_id} and will investigate your billing concern.
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Billing inquiry
-- Priority: Normal
-
-Our billing team will contact you within 2 hours to:
-- Review your account
-- Resolve the billing issue
-- Process any necessary refunds
-- Update payment methods if needed
-
-Is there anything else I can help you with today?"""
-            
-            elif intent == 'technical':
-                issue = entities.get('issue_description', 'your technical issue')
-                return f"""✅ **Technical Issue Logged!**
-
-I've recorded your technical concern: {issue}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Technical support
-- Priority: Normal
-
-Our technical team will contact you within 2 hours to:
-- Troubleshoot the issue
-- Provide step-by-step solutions
-- Escalate if needed
-- Follow up until resolved
-
-Is there anything else I can help you with today?"""
-            
-            elif intent == 'account':
-                email = entities.get('email', 'your account')
-                return f"""✅ **Account Issue Addressed!**
-
-I have your email: {email} and will help with your account concern.
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Account support
-- Priority: Normal
-
-Our account team will contact you within 2 hours to:
-- Verify your identity
-- Resolve the account issue
-- Provide necessary instructions
-- Ensure secure access
-
-Is there anything else I can help you with today?"""
-            
+            if llm:
+                result = run_extraction(self.schema, text, llm)
+                return result or {}
             else:
-                return """✅ **Issue Logged Successfully!**
-
-I've recorded your concern and created a support ticket.
-
-🎫 **Support Ticket Created**
-- Our team will contact you within 2 hours
-- We'll work to resolve your issue promptly
-- You'll receive regular updates
-
-Is there anything else I can help you with today?"""
+                return naive_entity_extract(text)
                 
+        except ImportError:
+            logger.warning("LangExtract not available; using regex fallback.")
+            return naive_entity_extract(text)
         except Exception as e:
-            logger.error(f"Error generating resolution response: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _ask_for_missing_info(self, intent: str, entities: Dict, conversation_context: List[Dict] = None, conversation_id: str = None) -> str:
-        """Ask for missing information using config-driven state machine"""
+            logger.exception("LangExtract extraction failed; fallback to regex: %s", e)
+            return naive_entity_extract(text)
+
+
+# ------------------------------
+# Naive regex-based entity extraction (fallback)
+# ------------------------------
+
+ORDER_ID_RE = re.compile(r"(?:order|ord|#)\s*[:#-]?\s*([A-Z0-9-]{4,})", re.I)
+EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+%-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d\s-]{7,}\d")
+AMOUNT_RE = re.compile(r"(?:rs|inr|usd|\$)\s*([0-9]+(?:\.[0-9]{1,2})?)", re.I)
+DATE_RE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|\d{1,2} \w+ \d{4})\b")
+
+PRODUCT_HINTS = ["shirt", "phone", "laptop", "charger", "headphones", "jeans", "dress", "earbuds"]
+
+
+def naive_entity_extract(text: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    m = ORDER_ID_RE.search(text)
+    if m:
+        out["order_id"] = m.group(1)
+    m = EMAIL_RE.search(text)
+    if m:
+        out["email"] = m.group(0)
+    m = PHONE_RE.search(text)
+    if m:
+        out["phone"] = m.group(0)
+    m = AMOUNT_RE.search(text)
+    if m:
+        out["amount"] = m.group(1)
+    m = DATE_RE.search(text)
+    if m:
+        out["date"] = m.group(0)
+    # crude product guess
+    for p in PRODUCT_HINTS:
+        if re.search(rf"\b{re.escape(p)}\b", text, re.I):
+            out.setdefault("product", p)
+            break
+    return out
+
+
+# ------------------------------
+# Intent classification (multi-intent + confidence)
+# ------------------------------
+
+INTENTS = ["billing", "technical", "account", "complaints", "general"]
+
+INTENT_KEYWORDS = {
+    "billing": ["invoice", "payment", "charge", "refund", "bill", "amount"],
+    "technical": ["bug", "error", "crash", "not working", "technical", "issue", "broken"],
+    "account": ["login", "password", "account", "email", "sign in", "profile"],
+    "complaints": ["complaint", "angry", "bad", "late", "broken", "damaged", "wrong size"],
+    "general": ["query", "question", "info", "information", "help"],
+}
+
+
+def softmax(xs: List[float]) -> List[float]:
+    m = max(xs) if xs else 0
+    exps = [math.exp(x - m) for x in xs]
+    s = sum(exps) or 1
+    return [e / s for e in exps]
+
+
+def score_intents(text: str) -> Dict[str, float]:
+    # Keyword hit-rate + simple heuristics; optionally blend with LLM zero-shot
+    scores: List[float] = []
+    for intent in INTENTS:
+        hits = sum(1 for kw in INTENT_KEYWORDS[intent] if kw in text.lower())
+        scores.append(float(hits))
+    probs = softmax(scores)
+    return {INTENTS[i]: probs[i] for i in range(len(INTENTS))}
+
+
+def multi_intent(text: str, threshold: float = 0.15) -> List[Tuple[str, float]]:
+    probs = score_intents(text)
+    ranked = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+    return [(k, v) for k, v in ranked if v >= threshold]
+
+
+# ------------------------------
+# Embeddings-based intent classifier (Cohere)
+# ------------------------------
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1e-8
+    nb = math.sqrt(sum(y * y for y in b)) or 1e-8
+    return dot / (na * nb)
+
+
+INTENT_SEEDS: Dict[str, List[str]] = {
+    "billing": [
+        "refund request",
+        "return request",
+        "exchange request",
+        "return an order",
+        "charged incorrectly",
+        "payment failed",
+        "billing issue",
+    ],
+    "technical": [
+        "app not working",
+        "website error",
+        "bug in product",
+        "can't login due to error",
+        "feature broken",
+    ],
+    "account": [
+        "reset password",
+        "update email",
+        "account locked",
+        "change profile details",
+        "login help",
+    ],
+    "complaints": [
+        "package arrived damaged",
+        "late delivery",
+        "poor quality",
+        "wrong size received",
+        "file a complaint",
+    ],
+    "general": [
+        "hi",
+        "hello",
+        "i need help",
+        "have a question",
+        "support",
+    ],
+}
+
+
+class IntentClassifier:
+    def __init__(self, embedder: "EmbeddingBackend"):
+        self.embedder = embedder
+        self.centroids: Dict[str, List[float]] = {}
         try:
-            # Get or create conversation state
-            if conversation_id not in self.active_conversations:
-                self.active_conversations[conversation_id] = {
-                    'flow': intent,
-                    'current_step': 0,
-                    'data': {},
-                    'locked_intent': intent
-                }
-            
-            conv_state = self.active_conversations[conversation_id]
-            
-            # Lock the intent for this conversation
-            if not conv_state['locked_intent']:
-                conv_state['locked_intent'] = intent
-            
-            # Get all entities from conversation context and current message
-            context_entities = {}
-            if conversation_context and len(conversation_context) > 0:
-                for msg in conversation_context:
-                    if msg.get('entities'):
-                        for key, value in msg['entities'].items():
-                            if key not in context_entities:
-                                context_entities[key] = value
-                                conv_state['data'][key] = value
-            
-            # Merge with current entities
-            all_entities = {**context_entities, **entities}
-            for key, value in entities.items():
-                conv_state['data'][key] = value
-            
-            # Use the locked intent, not the current classified intent
-            locked_intent = conv_state['locked_intent']
-            
-            # Check if we have a flow defined for this intent
-            if locked_intent not in self.conversation_flows:
-                return self._get_intent_specific_response(intent, "", conversation_context)
-            
-            flow = self.conversation_flows[locked_intent]
-            current_step = conv_state['current_step']
-            
-            # Check if we can move to the next step
-            if current_step < len(flow['steps']):
-                step = flow['steps'][current_step]
-                entity_name = step['entity']
-                
-                # Check if we have the data for this step
-                if entity_name in conv_state['data']:
-                    # Validate the data
-                    if step['validation'](conv_state['data'][entity_name]):
-                        # Move to next step
-                        conv_state['current_step'] += 1
-                        current_step = conv_state['current_step']
-                        
-                        # If we've completed all steps, finalize the flow
-                        if current_step >= len(flow['steps']):
-                            return flow['finalize'](conv_state['data'])
-                        else:
-                            # Ask for next step
-                            next_step = flow['steps'][current_step]
-                            next_ask = next_step['ask']
-                            # Handle dynamic questions (lambda functions)
-                            if callable(next_ask):
-                                return next_ask(conv_state['data'])
-                            else:
-                                return next_ask
-                    else:
-                        # Data validation failed, ask again
-                        ask = step['ask']
-                        if callable(ask):
-                            return ask(conv_state['data'])
-                        else:
-                            return ask
-                else:
-                    # Ask for current step data
-                    ask = step['ask']
-                    if callable(ask):
-                        return ask(conv_state['data'])
-                    else:
-                        return ask
-            else:
-                # All steps completed, finalize the flow
-                return flow['finalize'](conv_state['data'])
-            
-        except Exception as e:
-            logger.error(f"Error asking for missing info: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    # DST Flow Finalization Methods
-    def _finalize_return_flow_dst(self, data: Dict) -> str:
-        """Finalize return flow using DST engine"""
+            # Build centroids by averaging seed embeddings per intent
+            all_texts: List[str] = []
+            index_map: List[Tuple[str, int]] = []  # (intent, local_index)
+            for intent, seeds in INTENT_SEEDS.items():
+                for s in seeds:
+                    index_map.append((intent, len(all_texts)))
+                    all_texts.append(s)
+            if all_texts:
+                vecs = self.embedder.embed(all_texts)
+                accum: Dict[str, List[float]] = {k: [0.0] * len(vecs[0]) for k in INTENT_SEEDS.keys()}
+                counts: Dict[str, int] = {k: 0 for k in INTENT_SEEDS.keys()}
+                for (intent, idx), v in zip(index_map, vecs):
+                    accum[intent] = [a + b for a, b in zip(accum[intent], v)]
+                    counts[intent] += 1
+                for intent in accum.keys():
+                    c = counts[intent] or 1
+                    self.centroids[intent] = [a / c for a in accum[intent]]
+        except Exception:
+            logger.exception("Failed to initialize embeddings-based intent centroids; will fallback to keywords.")
+            self.centroids = {}
+
+    def classify(self, text: str, threshold: float = 0.05) -> List[Tuple[str, float]]:
         try:
-            order_id = data.get('order_id', 'your order')
-            reason = data.get('reason', 'your return reason')
-            resolution = data.get('resolution', 'refund')
-            
-            if 'refund' in resolution.lower():
-                return f"""✅ **Refund Request Processed Successfully!**
+            if not self.centroids:
+                raise RuntimeError("No centroids")
+            qv = self.embedder.embed([text])[0]
+            sims: Dict[str, float] = {}
+            for intent, cv in self.centroids.items():
+                sims[intent] = _cosine_similarity(qv, cv)
+            # Convert similarities to probabilities for stability
+            intents = list(sims.keys())
+            probs = softmax(list(sims.values()))
+            ranked = sorted(zip(intents, probs), key=lambda x: x[1], reverse=True)
+            # Prefer non-general over general when close
+            if ranked and ranked[0][0] == "general" and len(ranked) > 1:
+                second = ranked[1]
+                if second[1] >= ranked[0][1] * 0.9:  # within 10%
+                    ranked[0], ranked[1] = ranked[1], ranked[0]
+            return [(k, float(v)) for k, v in ranked if v >= threshold]
+        except Exception:
+            # Fallback to keyword model on any failure
+            return multi_intent(text)
 
-Perfect! I've processed your refund request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Refund to original payment method
 
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Refund request
-- Priority: High
-- Status: Processing
+# ------------------------------
+# LLM interface (Gemini/OpenAI/GROQ)
+# ------------------------------
 
-📋 **Next Steps:**
-- Refund will be processed within 3-5 business days
-- You'll receive email confirmation
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
+class LLM:
+    def __init__(self, provider: str = LLM_PROVIDER, model: str = LLM_MODEL):
+        self.provider = provider
+        self.model = model
+        self._setup()
 
-💰 **Refund Timeline:**
-- Processing: 1-2 business days
-- Bank processing: 3-5 business days
-- Appears on your statement within 5-7 days
-
-Is there anything else I can help you with today?"""
-            
-            elif 'replacement' in resolution.lower():
-                return f"""✅ **Replacement Request Processed Successfully!**
-
-Perfect! I've processed your replacement request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Replacement item
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Replacement request
-- Priority: High
-- Status: Processing
-
-📦 **Next Steps:**
-- Replacement will be shipped within 24 hours
-- You'll receive new tracking number
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
-
-🚚 **Shipping Timeline:**
-- Processing: Same day
-- Shipping: Next business day
-- Delivery: 3-5 business days
-
-Is there anything else I can help you with today?"""
-            
-            else:
-                return f"""✅ **Exchange Request Processed Successfully!**
-
-Perfect! I've processed your exchange request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Exchange for different item
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Exchange request
-- Priority: High
-- Status: Processing
-
-🔄 **Next Steps:**
-- Exchange will be processed within 24 hours
-- You'll receive new tracking number
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing return flow DST: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_shipping_flow_dst(self, data: Dict) -> str:
-        """Finalize shipping flow using DST engine"""
+    def _setup(self):
+        self.client = None
         try:
-            order_id = data.get('order_id', 'your order')
-            shipping_issue = data.get('shipping_issue', 'your shipping concern')
-            
-            return f"""✅ **Shipping Issue Addressed Successfully!**
+            if self.provider == "gemini":
+                import google.generativeai as genai
+                genai.configure(api_key=GEMINI_API_KEY)
+                self.client = genai.GenerativeModel(self.model)
+            elif self.provider == "openai":
+                from openai import OpenAI
+                self.client = OpenAI(api_key=OPENAI_API_KEY)
+            elif self.provider == "groq":
+                import groq
+                self.client = groq.Groq(api_key=GROQ_API_KEY)
+        except Exception:
+            logger.exception("LLM client init failed — will fallback to template responses.")
 
-Perfect! I've processed your shipping concern:
-- Order ID: {order_id}
-- Issue: {shipping_issue}
+    def generate(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
+        if self.provider == "gemini" and self.client:
+            try:
+                resp = self.client.generate_content(prompt)
+                return getattr(resp, "text", "") or ""
+            except Exception:
+                logger.exception("Gemini generation failed")
+                return ""
+        elif self.provider == "openai" and self.client:
+            try:
+                chat = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return chat.choices[0].message.content
+            except Exception:
+                logger.exception("OpenAI chat failed")
+                return ""
+        elif self.provider == "groq" and self.client:
+            try:
+                chat = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return chat.choices[0].message.content
+            except Exception:
+                logger.exception("GROQ chat failed")
+                return ""
+        # Fallback deterministic template
+        return "I'm unable to generate a response right now. Please try again later."
 
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Shipping inquiry
-- Priority: Normal
-- Status: Processing
 
-📦 **Next Steps:**
-- Our shipping team will review your order within 2 hours
-- You'll receive current shipping status and tracking information
-- Any necessary actions will be communicated promptly
-- Estimated delivery updates will be provided
+# ------------------------------
+# Context packing & answer synthesis
+# ------------------------------
 
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing shipping flow DST: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_billing_flow_dst(self, data: Dict) -> str:
-        """Finalize billing flow using DST engine"""
+ANSWER_SYS_PROMPT = (
+    "You are a helpful, terse customer support assistant. "
+    "Use ONLY the provided context. If missing, say you don't have enough info and suggest next steps. "
+    "Cite sources as [filename] at the end where relevant."
+)
+
+
+def build_prompt(user_query: str, context_chunks: List[DocChunk], chat_state: ChatState, extracted: Dict[str, Any]) -> str:
+    # Build citations map
+    ctx_parts = []
+    token_budget = MAX_CONTEXT_TOKENS
+    for ch in context_chunks:
+        t = ch.text.strip()
+        if not t:
+            continue
+        if token_budget <= 0:
+            break
+        tk = estimate_tokens(t)
+        if tk > token_budget:
+            t = t[: token_budget * 4]
+        ctx_parts.append(f"[Source: {Path(ch.source).name}]\n{t}")
+        token_budget -= tk
+
+    history_snippets = []
+    # In production, use a summarizer; here we keep last few turns
+    for turn in chat_state.history[-6:]:
+        history_snippets.append(f"{turn.role}: {turn.content}")
+    history_text = "\n".join(history_snippets)
+
+    extracted_text = json.dumps(extracted, ensure_ascii=False)
+
+    prompt = f"""
+{ANSWER_SYS_PROMPT}
+
+Conversation so far:
+{history_text}
+
+User question:
+{user_query}
+
+Extracted structured info (may be partial):
+{extracted_text}
+
+Knowledge context:
+{os.linesep.join(ctx_parts)}
+
+Write a concise, actionable answer for the user. When appropriate, ask exactly one clarifying question. Include citations using [filename] if you quoted or used a specific source.
+""".strip()
+    return prompt
+
+
+# ------------------------------
+# Clarification & fallback logic
+# ------------------------------
+
+def should_ask_clarification(retrievals: List[RetrievalResult], min_score: float = RETRIEVAL_MIN_SCORE) -> bool:
+    if not retrievals:
+        return True
+    top = retrievals[0].score
+    return top < min_score
+
+
+def build_clarification_question(intents: List[Tuple[str, float]], entities: Dict[str, Any]) -> str:
+    # Choose clarifying based on missing core fields
+    if "order_id" not in entities:
+        return "Could you share your order ID so I can check the details?"
+    if not intents:
+        return "Could you tell me whether this is about billing, a technical issue, your account, or a complaint?"
+    return "Could you clarify a bit more so I can help precisely?"
+
+
+# ------------------------------
+# Analytics store (in-memory + log file persistence)
+# ------------------------------
+
+class Analytics:
+    def __init__(self):
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.interactions: List[Dict[str, Any]] = []
+
+    def record(self, payload: Dict[str, Any]):
+        self.interactions.append(payload)
         try:
-            order_id = data.get('order_id', 'your order')
-            billing_issue = data.get('billing_issue', 'your billing concern')
-            
-            return f"""✅ **Billing Issue Addressed Successfully!**
-
-Perfect! I've processed your billing concern:
-- Order ID: {order_id}
-- Issue: {billing_issue}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Billing inquiry
-- Priority: Normal
-- Status: Processing
-
-💳 **Next Steps:**
-- Our billing team will investigate within 2 hours
-- You'll receive detailed analysis of the issue
-- Any necessary refunds will be processed promptly
-- Payment method updates will be arranged if needed
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing billing flow DST: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_technical_flow_dst(self, data: Dict) -> str:
-        """Finalize technical flow using DST engine"""
-        try:
-            issue_description = data.get('issue_description', 'your technical issue')
-            device_info = data.get('device_info', 'your device information')
-            
-            return f"""✅ **Technical Issue Logged Successfully!**
-
-Perfect! I've recorded your technical concern:
-- Issue: {issue_description}
-- Device: {device_info}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Technical support
-- Priority: Normal
-- Status: Processing
-
-🛠️ **Next Steps:**
-- Our technical team will contact you within 2 hours
-- We'll provide step-by-step troubleshooting solutions
-- If needed, we'll escalate to senior technicians
-- We'll follow up until the issue is resolved
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing technical flow DST: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_account_flow_dst(self, data: Dict) -> str:
-        """Finalize account flow using DST engine"""
-        try:
-            email = data.get('email', 'your account')
-            account_issue = data.get('account_issue', 'your account concern')
-            
-            return f"""✅ **Account Issue Addressed Successfully!**
-
-Perfect! I've processed your account concern:
-- Email: {email}
-- Issue: {account_issue}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Account support
-- Priority: Normal
-- Status: Processing
-
-🔐 **Next Steps:**
-- Our account team will contact you within 2 hours
-- We'll verify your identity and resolve the issue
-- Any necessary instructions will be provided
-- We'll ensure secure access to your account
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing account flow DST: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_return_flow(self, data: Dict) -> str:
-        """Finalize return flow and create support ticket"""
-        try:
-            order_id = data.get('order_id', 'your order')
-            reason = data.get('reason', 'your return reason')
-            resolution = data.get('resolution_choice', 'refund')
-            
-            # Clear conversation state after resolution
-            if hasattr(self, 'active_conversations'):
-                # Find and clear the conversation
-                for conv_id, conv_state in list(self.active_conversations.items()):
-                    if conv_state.get('flow') == 'return':
-                        del self.active_conversations[conv_id]
-                        break
-            
-            if 'refund' in resolution.lower():
-                return f"""✅ **Refund Request Processed Successfully!**
-
-Perfect! I've processed your refund request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Refund to original payment method
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Refund request
-- Priority: High
-- Status: Processing
-
-📋 **Next Steps:**
-- Refund will be processed within 3-5 business days
-- You'll receive email confirmation
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
-
-💰 **Refund Timeline:**
-- Processing: 1-2 business days
-- Bank processing: 3-5 business days
-- Appears on your statement within 5-7 days
-
-Is there anything else I can help you with today?"""
-            
-            elif 'replacement' in resolution.lower():
-                return f"""✅ **Replacement Request Processed Successfully!**
-
-Perfect! I've processed your replacement request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Replacement item
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Replacement request
-- Priority: High
-- Status: Processing
-
-📦 **Next Steps:**
-- Replacement will be shipped within 24 hours
-- You'll receive new tracking number
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
-
-🚚 **Shipping Timeline:**
-- Processing: Same day
-- Shipping: Next business day
-- Delivery: 3-5 business days
-
-Is there anything else I can help you with today?"""
-            
-            else:
-                return f"""✅ **Exchange Request Processed Successfully!**
-
-Perfect! I've processed your exchange request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Exchange for different item
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Exchange request
-- Priority: High
-- Status: Processing
-
-🔄 **Next Steps:**
-- Exchange will be processed within 24 hours
-- You'll receive new tracking number
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing return flow: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_shipping_flow(self, data: Dict) -> str:
-        """Finalize shipping flow and create support ticket"""
-        try:
-            order_id = data.get('order_id', 'your order')
-            shipping_issue = data.get('shipping_issue', 'your shipping concern')
-            
-            # Clear conversation state
-            if hasattr(self, 'active_conversations'):
-                for conv_id, conv_state in list(self.active_conversations.items()):
-                    if conv_state.get('flow') == 'shipping':
-                        del self.active_conversations[conv_id]
-                        break
-            
-            return f"""✅ **Shipping Issue Addressed Successfully!**
-
-Perfect! I've processed your shipping concern:
-- Order ID: {order_id}
-- Issue: {shipping_issue}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Shipping inquiry
-- Priority: Normal
-- Status: Processing
-
-📦 **Next Steps:**
-- Our shipping team will review your order within 2 hours
-- You'll receive current shipping status and tracking information
-- Any necessary actions will be communicated promptly
-- Estimated delivery updates will be provided
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing shipping flow: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_billing_flow(self, data: Dict) -> str:
-        """Finalize billing flow and create support ticket"""
-        try:
-            order_id = data.get('order_id', 'your order')
-            billing_issue = data.get('billing_issue', 'your billing concern')
-            
-            # Clear conversation state
-            if hasattr(self, 'active_conversations'):
-                for conv_id, conv_state in list(self.active_conversations.items()):
-                    if conv_state.get('flow') == 'billing':
-                        del self.active_conversations[conv_id]
-                        break
-            
-            return f"""✅ **Billing Issue Addressed Successfully!**
-
-Perfect! I've processed your billing concern:
-- Order ID: {order_id}
-- Issue: {billing_issue}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Billing inquiry
-- Priority: Normal
-- Status: Processing
-
-💳 **Next Steps:**
-- Our billing team will investigate within 2 hours
-- You'll receive detailed analysis of the issue
-- Any necessary refunds will be processed promptly
-- Payment method updates will be arranged if needed
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing billing flow: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_technical_flow(self, data: Dict) -> str:
-        """Finalize technical flow and create support ticket"""
-        try:
-            issue_description = data.get('issue_description', 'your technical issue')
-            device_info = data.get('device_info', 'your device information')
-            
-            # Clear conversation state
-            if hasattr(self, 'active_conversations'):
-                for conv_id, conv_state in list(self.active_conversations.items()):
-                    if conv_state.get('flow') == 'technical':
-                        del self.active_conversations[conv_id]
-                        break
-            
-            return f"""✅ **Technical Issue Logged Successfully!**
-
-Perfect! I've recorded your technical concern:
-- Issue: {issue_description}
-- Device: {device_info}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Technical support
-- Priority: Normal
-- Status: Processing
-
-🛠️ **Next Steps:**
-- Our technical team will contact you within 2 hours
-- We'll provide step-by-step troubleshooting solutions
-- If needed, we'll escalate to senior technicians
-- We'll follow up until the issue is resolved
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing technical flow: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _finalize_account_flow(self, data: Dict) -> str:
-        """Finalize account flow and create support ticket"""
-        try:
-            email = data.get('email', 'your account')
-            account_issue = data.get('account_issue', 'your account concern')
-            
-            # Clear conversation state
-            if hasattr(self, 'active_conversations'):
-                for conv_id, conv_state in list(self.active_conversations.items()):
-                    if conv_state.get('flow') == 'account':
-                        del self.active_conversations[conv_id]
-                        break
-            
-            return f"""✅ **Account Issue Addressed Successfully!**
-
-Perfect! I've processed your account concern:
-- Email: {email}
-- Issue: {account_issue}
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Account support
-- Priority: Normal
-- Status: Processing
-
-🔐 **Next Steps:**
-- Our account team will contact you within 2 hours
-- We'll verify your identity and resolve the issue
-- Any necessary instructions will be provided
-- We'll ensure secure access to your account
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error finalizing account flow: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _ask_for_specific_slot(self, intent: str, slot_name: str, slot_data: Dict) -> str:
-        """Ask for a specific slot in the slot-filling flow"""
-        try:
-            if intent == 'return':
-                if slot_name == 'order_id':
-                    return """🔄 **Return Request**
-
-I'd be happy to help you with your return!
-
-🔍 **I need your order ID to assist you:**
-- Please provide your order number
-- You can find this in your order confirmation email
-
-**Example:** "I want to return order 12345"
-
-Once you provide the order ID, I can help process your return request."""
-                
-                elif slot_name == 'reason':
-                    order_id = slot_data.get('order_id', 'your order')
-                    return f"""✅ **Order ID Received: {order_id}**
-
-Great! Now I need to know the reason for your return:
-
-🔍 **Why are you returning this item?**
-- Damaged or defective product
-- Wrong item received
-- Size doesn't fit
-- Changed your mind
-- Other reason
-
-**Example:** "The product was damaged during shipping" or "I received the wrong item"
-
-Once you tell me the reason, I can process your return request."""
-                
-                elif slot_name == 'resolution_choice':
-                    order_id = slot_data.get('order_id', 'your order')
-                    reason = slot_data.get('reason', 'your return reason')
-                    return f"""✅ **Return Details Complete**
-
-Perfect! I have all the information I need:
-- Order ID: {order_id}
-- Reason: {reason}
-
-Now I need to know your preference:
-
-🔍 **What would you like?**
-- **Refund**: Money back to your original payment method
-- **Replacement**: Same item shipped to you again
-- **Exchange**: Different item of equal value
-
-**Example:** "I want a refund" or "I'd like a replacement"
-
-Once you choose, I can immediately process your request and create a support ticket."""
-            
-            elif intent == 'shipping':
-                if slot_name == 'order_id':
-                    return """📦 **Shipping Assistance**
-
-I'd be happy to help with your shipping concern!
-
-🔍 **I need your order ID to assist you:**
-- Please provide your order number
-- You can find this in your order confirmation email
-- Or check your account order history
-
-**Example:** "My order ID is 12345" or "Where is order 12345?"
-
-Once you provide the order ID, I can immediately create a support ticket and get our shipping team involved."""
-            
-            elif intent == 'billing':
-                if slot_name == 'order_id':
-                    return """💳 **Billing Assistance**
-
-I'd be happy to help with your billing concern!
-
-🔍 **I need your order ID or transaction ID:**
-- Please provide your order number
-- Or the transaction ID from your bank statement
-- You can find this in your order confirmation email
-
-**Example:** "I was charged twice for order 12345"
-
-Once you provide the order ID, I can immediately investigate and create a support ticket."""
-                
-                elif slot_name == 'billing_issue':
-                    order_id = slot_data.get('order_id', 'your order')
-                    return f"""✅ **Order ID Received: {order_id}**
-
-Great! Now I need to know the specific billing issue:
-
-🔍 **What billing problem are you experiencing?**
-- Duplicate charge
-- Incorrect amount charged
-- Payment failed
-- Refund not received
-- Subscription billing issue
-- Other billing concern
-
-**Example:** "I was charged twice for the same order" or "My payment failed during checkout"
-
-Once you describe the issue, I can investigate and create a support ticket."""
-            
-            elif intent == 'technical':
-                if slot_name == 'issue_description':
-                    return """🛠️ **Technical Support**
-
-I'd be happy to help with your technical issue!
-
-🔍 **Please describe the problem:**
-- What exactly is happening?
-- What were you trying to do?
-- What error messages do you see?
-- What device/browser are you using?
-
-**Examples:**
-- "I can't log into my account"
-- "The app keeps crashing on my iPhone"
-- "I get an error when trying to checkout"
-
-Once you provide details, I can create a support ticket for our technical team."""
-            
-            elif intent == 'account':
-                if slot_name == 'email':
-                    return """🔐 **Account Support**
-
-I'd be happy to help with your account issue!
-
-🔍 **I need your email address:**
-- Please provide the email associated with your account
-- This helps me verify your identity and access
-
-**Example:** "I can't log into john@email.com"
-
-Once you provide your email, I can immediately assist with your account concern."""
-                
-                elif slot_name == 'account_issue':
-                    email = slot_data.get('email', 'your account')
-                    return f"""✅ **Email Received: {email}**
-
-Great! Now I need to know the specific account issue:
-
-🔍 **What account problem are you experiencing?**
-- Can't log in
-- Forgot password
-- Account locked
-- Need to update profile
-- Two-factor authentication issue
-- Other account concern
-
-**Examples:**
-- "I forgot my password"
-- "My account is locked after too many failed attempts"
-- "I need to update my email address"
-
-Once you describe the issue, I can assist you and create a support ticket if needed."""
-            
-            else:
-                return f"""I need more information to help you with your {intent} request.
-
-🔍 **Please provide:**
-- {slot_name.replace('_', ' ').title()}
-
-This will help me assist you properly."""
-                
-        except Exception as e:
-            logger.error(f"Error asking for specific slot: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _ask_for_resolution_choice(self, intent: str, slot_data: Dict) -> str:
-        """Ask for resolution choice when all required slots are filled"""
-        try:
-            if intent == 'return':
-                order_id = slot_data.get('order_id', 'your order')
-                reason = slot_data.get('reason', 'your return reason')
-                return f"""✅ **Return Details Complete**
-
-Perfect! I have all the information I need:
-- Order ID: {order_id}
-- Reason: {reason}
-
-Now I need to know your preference:
-
-🔍 **What would you like?**
-- **Refund**: Money back to your original payment method
-- **Replacement**: Same item shipped to you again
-- **Exchange**: Different item of equal value
-
-**Example:** "I want a refund" or "I'd like a replacement"
-
-Once you choose, I can immediately process your request and create a support ticket."""
-            
-            else:
-                return """✅ **Information Complete**
-
-I have all the information I need to help you!
-
-🎫 **Support Ticket Created**
-- Our team will contact you within 2 hours
-- We'll work to resolve your issue promptly
-- You'll receive regular updates
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error asking for resolution choice: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _handle_resolution_choice(self, intent: str, choice: str, slot_data: Dict, conversation_id: str) -> str:
-        """Handle the user's resolution choice and create final ticket"""
-        try:
-            if intent == 'return':
-                order_id = slot_data.get('order_id', 'your order')
-                reason = slot_data.get('reason', 'your return reason')
-                
-                if 'refund' in choice.lower():
-                    # Clear conversation state after resolution
-                    if conversation_id in self.active_conversations:
-                        del self.active_conversations[conversation_id]
-                    
-                    return f"""✅ **Refund Request Processed Successfully!**
-
-Perfect! I've processed your refund request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Refund to original payment method
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Refund request
-- Priority: High
-- Status: Processing
-
-📋 **Next Steps:**
-- Refund will be processed within 3-5 business days
-- You'll receive email confirmation
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
-
-💰 **Refund Timeline:**
-- Processing: 1-2 business days
-- Bank processing: 3-5 business days
-- Appears on your statement within 5-7 days
-
-Is there anything else I can help you with today?"""
-                
-                elif 'replacement' in choice.lower():
-                    # Clear conversation state after resolution
-                    if conversation_id in self.active_conversations:
-                        del self.active_conversations[conversation_id]
-                    
-                    return f"""✅ **Replacement Request Processed Successfully!**
-
-Perfect! I've processed your replacement request:
-- Order ID: {order_id}
-- Reason: {reason}
-- Resolution: Replacement item
-
-🎫 **Support Ticket Created**
-- Ticket ID: TKT-{uuid.uuid4().hex[:8].upper()}
-- Type: Replacement request
-- Priority: High
-- Status: Processing
-
-📦 **Next Steps:**
-- Replacement will be shipped within 24 hours
-- You'll receive new tracking number
-- Return shipping label will be sent within 2 hours
-- Our team will contact you to arrange pickup
-
-🚚 **Shipping Timeline:**
-- Processing: Same day
-- Shipping: Next business day
-- Delivery: 3-5 business days
-
-Is there anything else I can help you with today?"""
-                
-                else:
-                    return """I didn't catch your preference clearly. 
-
-🔍 **Please choose one of these options:**
-- **Refund**: "I want a refund"
-- **Replacement**: "I'd like a replacement"
-- **Exchange**: "I want to exchange for something else"
-
-Which would you prefer?"""
-            
-            else:
-                # Clear conversation state after resolution
-                if conversation_id in self.active_conversations:
-                    del self.active_conversations[conversation_id]
-                
-                return """✅ **Issue Resolved Successfully!**
-
-I've processed your request and created a support ticket.
-
-🎫 **Support Ticket Created**
-- Our team will contact you within 2 hours
-- We'll work to resolve your issue promptly
-- You'll receive regular updates
-
-Is there anything else I can help you with today?"""
-                
-        except Exception as e:
-            logger.error(f"Error handling resolution choice: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. Please try again or contact our support team for assistance."
-    
-    def _get_intent_specific_response(self, intent: str, query: str, conversation_context: List[Dict] = None) -> str:
-        """Generate intent-specific responses when no knowledge base content is found"""
-        try:
-            # Check conversation context for existing entities
-            existing_entities = {}
-            if conversation_context and len(conversation_context) > 0:
-                for msg in conversation_context:
-                    if msg.get('entities'):
-                        for key, value in msg['entities'].items():
-                            if key not in existing_entities:
-                                existing_entities[key] = value
-            
-            if intent == 'billing':
-                # Check if we already have order_id from context
-                order_info = ""
-                if 'order_id' in existing_entities:
-                    order_info = f"\n✅ **Order ID**: {existing_entities['order_id']} (already provided)"
-                
-                return f"""I understand you have a billing question. While I don't have specific information about your account in my knowledge base, I can help you with general billing information:
-
-💳 **General Billing Information:**
-- Charges are typically processed within 24-48 hours of purchase
-- Refunds take 3-5 business days to appear on your statement
-- We accept all major credit cards and PayPal
-- Monthly subscriptions are charged on the same date each month{order_info}
-
-🔍 **To help you better, I need:**
-- Your order ID or account email
-- Specific billing issue (duplicate charge, refund request, etc.)
-- Date of the transaction
-
-Would you like me to create a support ticket so our billing team can assist you directly with your specific issue?"""
-            
-            elif intent == 'account':
-                return """I understand you need help with your account. Here's what I can help you with:
-
-🔐 **Account Management:**
-- Password reset (valid for 24 hours)
-- Account lockout assistance (occurs after 5 failed attempts)
-- Two-factor authentication setup
-- Profile information updates
-- Account deletion requests (processed within 30 days)
-
-🔍 **To help you better, I need:**
-- Your account email address
-- Specific account issue you're experiencing
-- Whether you can currently log in or not
-
-Would you like me to create a support ticket so our account team can assist you directly?"""
-            
-            elif intent == 'technical':
-                return """I understand you're experiencing technical issues. Here are some common solutions:
-
-🛠️ **Quick Troubleshooting Steps:**
-- Clear your browser cache and cookies
-- Check your internet connection
-- Try logging out and back in
-- Update your browser to the latest version
-- Disable browser extensions temporarily
-
-🔍 **To help you better, I need:**
-- What specific error you're seeing
-- What you were trying to do when it happened
-- Your browser and device information
-- Screenshot of the error (if possible)
-
-Would you like me to create a support ticket so our technical team can assist you directly?"""
-            
-            elif intent == 'shipping':
-                return """I understand you have shipping or delivery questions. Here's what I can tell you:
-
-📦 **Shipping Information:**
-- Standard shipping: 5-7 business days
-- Express shipping: 2-3 business days
-- Free shipping on orders over $50
-- Tracking numbers provided within 24 hours
-- International shipping available to most countries
-
-🔍 **To help you better, I need:**
-- Your order ID
-- Current shipping status
-- Whether you received a tracking number
-- Specific delivery issue you're experiencing
-
-Would you like me to create a support ticket so our shipping team can assist you directly?"""
-            
-            elif intent == 'return':
-                # Check if we already have order_id from context
-                order_info = ""
-                if 'order_id' in existing_entities:
-                    order_info = f"\n✅ **Order ID**: {existing_entities['order_id']} (already provided)"
-                
-                return f"""I understand you want to return an item. To process your return request, I need:
-
-🔄 **Return Requirements:**
-- Items can be returned within 30 days of purchase
-- Original packaging is required
-- Return shipping is free for defective items
-- Refunds issued to original payment method{order_info}
-
-🔍 **To help you better, I need:**
-- Your order ID
-- Product name/item description
-- Reason for return
-- Whether the item is defective or just unwanted
-
-Please provide the product details so I can assist you with the return process."""
-            
-            elif intent == 'complaint':
-                return """I understand you have a complaint and I want to help resolve this for you. 
-
-😔 **I'm here to listen and help:**
-- Your feedback is important to us
-- We want to understand what went wrong
-- We're committed to making things right
-
-🔍 **To help you better, I need:**
-- Your order ID (if applicable)
-- What specifically went wrong
-- When this issue occurred
-- What you expected vs. what happened
-- How we can make this right for you
-
-Would you like me to create a support ticket so our customer relations team can address your concern directly?"""
-            
-            else:
-                return """I understand you have a question, but I don't have specific information in my knowledge base to answer it accurately. 
-
-This could be because:
-- Your question is about a topic not covered in our current documentation
-- The information might be outdated or not yet added to our knowledge base
-- Your query might need more specific details
-
-🔍 **To help you better, I need:**
-- More specific details about your question
-- Any relevant order IDs or account information
-- What you're trying to accomplish
-
-I recommend:
-1. Providing more specific details about your issue
-2. Checking our FAQ section on our website
-3. Creating a support ticket for direct assistance
-
-Would you like me to create a support ticket so our team can help you directly?"""
-                
-        except Exception as e:
-            logger.error(f"Error generating intent-specific response: {e}")
-            return "I apologize, but I'm having trouble generating a response right now. Please try again or contact our support team for assistance."
-    
-    def is_ecommerce_related(self, query: str, conversation_context: List[Dict] = None) -> bool:
-        """Check if the query is related to e-commerce customer support"""
-        ecommerce_keywords = [
-            'order', 'purchase', 'buy', 'shopping', 'product', 'item', 'delivery', 'shipping',
-            'payment', 'billing', 'refund', 'return', 'exchange', 'account', 'login', 'password',
-            'tracking', 'package', 'invoice', 'charge', 'cost', 'price', 'website', 'app',
-            'customer', 'support', 'help', 'issue', 'problem', 'complaint', 'service',
-            'cart', 'checkout', 'receipt', 'confirmation', 'status', 'update', 'cancel',
-            'modify', 'address', 'shipping', 'tax', 'discount', 'coupon', 'promo', 'sale',
-            'inventory', 'stock', 'availability', 'warranty', 'guarantee', 'policy',
-            'damaged', 'broken', 'defective', 'faulty', 'wrong', 'incorrect', 'missing'
-        ]
-        
-        query_lower = query.lower()
-        
-        # Special case: website/app technical issues are ALWAYS e-commerce related
-        website_tech_keywords = ['website', 'app', 'loading', 'error', '404', '500', 'crash', 'freeze', 'slow', 'browser']
-        if any(keyword in query_lower for keyword in website_tech_keywords):
-            return True
-        
-        # Special case: Product names and brands are ALWAYS e-commerce related
-        # Common product categories and brand indicators
-        product_indicators = [
-            'sunscreen', 'cream', 'lotion', 'shampoo', 'soap', 'makeup', 'cosmetic',
-            'clothing', 'shirt', 'pants', 'dress', 'shoes', 'accessory', 'jewelry',
-            'electronics', 'phone', 'laptop', 'computer', 'tablet', 'camera',
-            'book', 'toy', 'game', 'food', 'beverage', 'supplement', 'vitamin',
-            'aqualogica', 'brand', 'product', 'item', 'goods', 'merchandise'
-        ]
-        
-        if any(indicator in query_lower for indicator in product_indicators):
-            return True
-        
-        # Special case: If this is a follow-up in an ongoing e-commerce conversation, 
-        # treat it as e-commerce related even if keywords don't match
-        if conversation_context and len(conversation_context) > 0:
-            # Check if previous messages were e-commerce related
-            previous_ecommerce = False
-            for msg in conversation_context[-3:]:  # Check last 3 messages
-                prev_query = msg.get('query', '').lower()
-                prev_intent = msg.get('intent', '')
-                
-                # More comprehensive check for e-commerce context
-                if any(keyword in prev_query for keyword in ecommerce_keywords + ['return', 'order', 'product', 'damaged', 'shipping', 'delivery', 'refund', 'exchange']):
-                    previous_ecommerce = True
-                    break
-                
-                # Check if previous intent was e-commerce related
-                if prev_intent in ['shipping', 'return', 'billing', 'account', 'technical', 'general']:
-                    previous_ecommerce = True
-                    break
-                
-                # Also check if this is a return conversation
-                if 'return' in prev_query or 'order' in prev_query:
-                    previous_ecommerce = True
-                    break
-            
-            if previous_ecommerce:
-                logger.info(f"Treating query as e-commerce related due to conversation context: {query}")
-                return True
-            
-        return any(keyword in query_lower for keyword in ecommerce_keywords)
-    
-    def should_create_ticket(self, intent: str, entities: Dict, confidence: float, query: str, context: List[Dict] = None, conversation_id: str = None) -> bool:
-        """Determine if a support ticket should be created"""
-        # Check if we already have a ticket for this conversation
-        if conversation_id and conversation_id in self.conversation_history:
-            # If we already have a ticket in this conversation, don't create another one
-            for message in self.conversation_history[conversation_id]:
-                if message.get('ticket_id'):
-                    logger.info(f"Ticket already exists for conversation {conversation_id}, skipping ticket creation")
-                    return False
-        
-        # Get conversation context for e-commerce check
-        conversation_context = None
-        if conversation_id and conversation_id in self.conversation_history:
-            conversation_context = self.conversation_history[conversation_id]
-        
-        # Don't create tickets for greetings
-        if intent == 'greeting':
-            logger.info(f"Skipping ticket creation for greeting: {query}")
-            return False
-        
-        # Always create ticket for off-topic queries
-        if not self.is_ecommerce_related(query, conversation_context):
-            logger.info(f"Creating ticket for off-topic query: {query}")
-            return True
-        
-        # Don't create tickets for simple follow-up responses in ongoing conversations
-        if conversation_id and conversation_id in self.conversation_history:
-            conversation_length = len(self.conversation_history[conversation_id])
-            if conversation_length > 1:
-                # This is a follow-up message, be more selective about tickets
-                logger.info(f"Follow-up message in conversation {conversation_id}, being selective about ticket creation")
-                
-                # Only create ticket if it's a critical issue or no content found
-                if context is None or len(context) == 0:
-                    logger.info(f"Creating ticket for no-content follow-up query: {query}")
-                    return True
-                
-                # Don't create tickets for low confidence in follow-ups (likely just clarifying questions)
-                if confidence < 0.3 and conversation_length > 2:
-                    logger.info(f"Skipping ticket for low confidence follow-up: {query}")
-                    return False
-        
-        # Create ticket if no relevant content found in knowledge base
-        if context is None or len(context) == 0:
-            logger.info(f"Creating ticket for no-content query: {query}")
-            return True
-            
-        ticket_intents = ['billing', 'technical', 'complaint']
-        
-        # Create ticket for high-priority intents
-        if intent in ticket_intents and confidence > 0.5:
-            logger.info(f"Creating ticket for high-priority intent: {intent} (confidence: {confidence})")
-            return True
-        
-        # Create ticket if specific entities are detected (order IDs, amounts, etc.)
-        if any(key in entities for key in ['order_id', 'amount', 'email']):
-            logger.info(f"Creating ticket for entity detection: {entities}")
-            return True
-        
-        # Create ticket for low confidence queries (might need human review)
-        if confidence < 0.3:
-            logger.info(f"Creating ticket for low confidence: {intent} (confidence: {confidence})")
-            return True
-        
-        # Create ticket for product names and follow-up queries that need human assistance
-        query_lower = query.lower()
-        product_keywords = ['sunscreen', 'cream', 'soap', 'lotion', 'shampoo', 'makeup', 'cosmetic', 'aqualogica']
-        if any(keyword in query_lower for keyword in product_keywords):
-            # If user provided order_id and product info, ALWAYS create ticket for returns
-            if 'order_id' in entities and 'product' in entities:
-                if intent in ['return', 'shipping', 'general']:
-                    logger.info(f"Creating ticket for return request with order {entities['order_id']} and product {entities.get('product')}")
-                    return True
-            
-            # Also check conversation context for order_id and product
-            if conversation_context and len(conversation_context) > 0:
-                has_order_id = any('order_id' in msg.get('entities', {}) for msg in conversation_context)
-                has_product = any('product' in msg.get('entities', {}) for msg in conversation_context)
-                
-                if has_order_id and has_product:
-                    logger.info(f"Creating ticket for return request with order and product from conversation context")
-                    return True
-            
-            logger.info(f"Creating ticket for product-related query: {query}")
-            return True
-        
-        # Create ticket for shipping and delivery issues
-        shipping_keywords = ['shipping', 'delivery', 'late', 'delayed', 'package', 'tracking', 'arrived', 'not received']
-        if any(keyword in query_lower for keyword in shipping_keywords):
-            logger.info(f"Creating ticket for shipping-related query: {query}")
-            return True
-        
-        # Create ticket for follow-up queries that seem to need human assistance
-        if conversation_id and conversation_id in self.conversation_history:
-            conversation_length = len(self.conversation_history[conversation_id])
-            if conversation_length > 2:  # After 3+ messages, create ticket for complex queries
-                logger.info(f"Creating ticket for complex follow-up in ongoing conversation: {query}")
-                return True
-        
-        return False
-    
-    def create_support_ticket(self, query: str, intent: str, entities: Dict) -> str:
-        """Create a support ticket"""
-        ticket_id = f"TKT-{str(uuid.uuid4())[:8].upper()}"
-        
-        # Determine ticket type
-        is_off_topic = not self.is_ecommerce_related(query, None)  # No context needed here
-        ticket_type = "off_topic" if is_off_topic else "customer_support"
-        
-        # Check if this is a "no content found" ticket
-        if is_off_topic:
-            ticket_reason = "off_topic_query"
-        else:
-            ticket_reason = "no_knowledge_base_content" if not entities else "customer_support"
-        
-        ticket_data = {
-            'id': ticket_id,
-            'query': query,
-            'intent': intent,
-            'entities': entities,
-            'ticket_type': ticket_type,
-            'ticket_reason': ticket_reason,
-            'created_at': datetime.now().isoformat(),
-            'status': 'open',
-            'priority': 'high' if is_off_topic else 'normal'
+            p = Path(LOG_DIR) / "interactions.jsonl"
+            with p.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.exception("Failed to persist interaction log")
+
+    def snapshot(self) -> Dict[str, Any]:
+        total = len(self.interactions)
+        sats = [x.get("feedback", {}).get("satisfaction") for x in self.interactions if x.get("feedback")]
+        sat_rate = sum(1 for s in sats if s == "up") / max(1, len(sats)) if sats else None
+        avg_latency = None
+        latencies = [x.get("timings", {}).get("total_ms", 0) for x in self.interactions if x.get("timings")]
+        if latencies:
+            avg_latency = sum(latencies) / len(latencies)
+        return {
+            "total_interactions": total,
+            "satisfaction_rate": sat_rate,
+            "avg_latency_ms": avg_latency,
         }
+
+
+ANALYTICS = Analytics()
+
+
+# ------------------------------
+# Core Chat Orchestrator
+# ------------------------------
+
+class ChatOrchestrator:
+    def __init__(self, data_dir: str = DEFAULT_DATA_DIR):
+        self.data_dir = data_dir
+        # Load or build index
+        self.embedder = EmbeddingBackend()
+        self.faiss = FAISSIndex()
+        ok = self.faiss.load()
+        if not ok:
+            logger.info("No FAISS index found. Building now from %s", data_dir)
+            corpus = build_corpus(data_dir)
+            if not corpus:
+                logger.warning("Empty corpus; hybrid retrieval will be degraded.")
+            self.faiss.build(corpus, self.embedder)
+        # BM25 over same corpus
+        corpus = [c for _, c in self.faiss.id2chunk.items()] if self.faiss.id2chunk else build_corpus(data_dir)
+        self.bm25 = BM25(corpus)
+        self.hybrid = HybridRetriever(self.faiss, self.bm25, self.embedder, HYBRID_WEIGHTS)
+        self.reranker = Reranker()
+        self.llm = LLM()
+        self.extractor = StructuredExtractor()
+        # Embeddings-based intent classifier (falls back automatically)
+        self.intent_classifier = IntentClassifier(self.embedder)
+        self.sessions: Dict[str, ChatState] = {}
+
+    # --- Session helpers ---
+    def _get_state(self, session_id: str) -> ChatState:
+        if session_id not in self.sessions:
+            self.sessions[session_id] = ChatState()
+        return self.sessions[session_id]
+
+    def _append_history(self, state: ChatState, role: str, content: str):
+        state.history.append(ChatTurn(role=role, content=content, timestamp=utcnow_str()))
+        # naive token estimate, rotate if too long
+        tot = sum(estimate_tokens(t.content) for t in state.history)
+        state.token_estimate = tot
+        while tot > MAX_CONTEXT_TOKENS * 1.5 and len(state.history) > 4:
+            # drop oldest non-system turn
+            state.history.pop(0)
+            tot = sum(estimate_tokens(t.content) for t in state.history)
+            state.token_estimate = tot
+
+    def _handle_smalltalk(self, user_text: str) -> Optional[str]:
+        """Handle basic greetings and smalltalk without going through RAG."""
+        user_text = user_text.lower().strip()
+        # If the message contains clear issue keywords or error codes, do not smalltalk
+        negative_keywords = [
+            "error", "exception", "crash", "crashing", "failed", "failure",
+            "cannot", "can't", "unable", "bug", "issue", "damaged", "return", "refund",
+            "password", "login", "account"
+        ]
+        if any(k in user_text for k in negative_keywords) or re.search(r"\b\d{3,}\b", user_text):
+            return None
         
-        # In a real system, this would be saved to a database
-        if is_off_topic:
-            logger.info(f"Created OFF-TOPIC support ticket: {ticket_id} for query: {query}")
-        elif ticket_reason == "no_knowledge_base_content":
-            logger.info(f"Created NO-CONTENT support ticket: {ticket_id} for query: {query}")
+        # Handle very short responses (whole-word match only)
+        if len(user_text.split()) <= 3:
+            smalltalk_responses = {
+                "hi": "Hello! 👋 How can I assist you today?",
+                "hello": "Hi there! 👋 What can I help you with?",
+                "hey": "Hey! 👋 How can I support you today?",
+                "thank you": "You're welcome! 😊 Glad I could help.",
+                "thanks": "You're welcome! 😊 Happy to assist.",
+                "yes": "Got it! 👍",
+                "no": "Alright, I won't proceed with that then.",
+                "ok": "Perfect! 👍",
+                "okay": "Great! 👍"
+            }
+            tokens = set(re.findall(r"[a-zA-Z]+", user_text))
+            for key, reply in smalltalk_responses.items():
+                if key in tokens:
+                    return reply
+        
+        # Handle longer but still simple greetings (whole-word and short length)
+        tokens = re.findall(r"[a-zA-Z]+", user_text)
+        token_set = set(tokens)
+        greeting_tokens = {"hi", "hello", "hey"}
+        phrase_greetings = ["good morning", "good afternoon", "good evening"]
+        if any(p in user_text for p in phrase_greetings) and len(tokens) <= 5:
+            return "Hello! 👋 How can I assist you today?"
+        if (token_set & greeting_tokens) and len(tokens) <= 4:
+            return "Hello! 👋 How can I assist you today?"
+        
+        # Don't treat date-related words as smalltalk
+        date_words = ["yesterday", "today", "tomorrow", "last week", "last month", "this week", "this month"]
+        if any(word in user_text for word in date_words):
+            return None
+        
+        return None
+
+    def _fill_slots(self, state: ChatState, entities: Dict[str, Any], user_text: str) -> None:
+        """Fill conversation slots with extracted entities and user input."""
+        # Update slots with extracted entities
+        for key, value in entities.items():
+            if key in state.slots and value and not state.slots[key]:
+                state.slots[key] = value
+        
+        # Also try to extract from user text directly
+        user_lower = user_text.lower().strip()
+
+        # Issue description: capture meaningful description but avoid auto-filling on short first messages
+        if not state.slots["issue_description"]:
+            trivial = {"hi", "hello", "hey", "ok", "okay", "thanks", "thank you", "yes", "no"}
+            meaningful_keywords = ["error", "code", "crash", "cannot", "can't", "unable", "exception", "stack", "trace", "failed", "failure"]
+            token_count = len(re.findall(r"[\w']+", user_lower))
+            question_words = ["how may i help you", "how can i help", "what can i do"]
+            is_meaningful = (
+                token_count >= 6 or any(k in user_lower for k in meaningful_keywords)
+            )
+            if user_lower not in trivial and not any(q in user_lower for q in question_words):
+                # Only set description if we're in collecting phase or the message is meaningful enough
+                if state.conversation_stage == "collecting_info" or is_meaningful:
+                    state.slots["issue_description"] = user_text.strip()
+        
+        # Handle order ID extraction - more flexible patterns, require digits
+        if not state.slots["order_id"]:
+            # Try multiple patterns for order ID
+            order_patterns = [
+                r"(?:order|ord|#)\s*[:#-]?\s*([A-Z]*\d[A-Z0-9-]{2,})",  # must contain at least one digit
+                r"(?:id|number)\s*(?:is|:)\s*([A-Z]*\d[A-Z0-9-]{2,})",
+                r"\b(\d{3,})\b",                                        # Any 3+ digit sequence (numbers only)
+                r"\b([A-Z]{2,}\d{2,})\b",                              # "AB12345" or "ORD12345"
+                r"\b(\d{2,}[A-Z]{2,})\b",                              # "12345AB"
+            ]
+            
+            for pattern in order_patterns:
+                order_match = re.search(pattern, user_text, re.I)
+                if order_match:
+                    state.slots["order_id"] = order_match.group(1)
+                    break
+            
+            # If no pattern match, try to extract any reasonable order ID from user input
+            if not state.slots["order_id"]:
+                # Look for common order ID indicators
+                order_indicators = ["order", "id", "number", "tracking", "reference", "confirmation"]
+                for indicator in order_indicators:
+                    if re.search(rf"\b{re.escape(indicator)}\b", user_lower):
+                        # Extract the word after the indicator
+                        words = user_text.split()
+                        for i, word in enumerate(words):
+                            if re.fullmatch(rf"{re.escape(indicator)}\b.*", word.lower()) or word.lower() == indicator.lower():
+                                # Try to get the next word as order ID
+                                if i + 1 < len(words):
+                                    potential_id = words[i + 1].strip(".,!?")
+                                    if len(potential_id) >= 3 and any(ch.isdigit() for ch in potential_id):
+                                        state.slots["order_id"] = potential_id
+                                        break
+                        break
         else:
-            logger.info(f"Created support ticket: {ticket_id}")
+            # If we already have an order_id, allow explicit overwrite if user provides a new clear ID
+            explicit = re.search(r"\b(?:order\s*id|order|id|number)\b.*?([A-Z]*\d[A-Z0-9-]{2,}|\d{3,})", user_text, re.I)
+            if explicit:
+                new_id = explicit.group(1)
+                if new_id and new_id != state.slots["order_id"]:
+                    state.slots["order_id"] = new_id
+
+        # If the current order_id is bogus (no digits), clear it so clarifiers behave
+        if state.slots.get("order_id") and not any(ch.isdigit() for ch in str(state.slots["order_id"])):
+            state.slots["order_id"] = None
         
-        self.analytics['total_tickets'] += 1
+        # Handle email extraction
+        if not state.slots["email"]:
+            email_match = re.search(r"[a-zA-Z0-9_.+%-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", user_text)
+            if email_match:
+                state.slots["email"] = email_match.group(0)
         
-        return ticket_id
-    
-    def process_query(self, query: str, conversation_id: str) -> Dict[str, Any]:
-        """Process a user query through the RAG pipeline with state management"""
-        start_time = time.time()
+        # Handle "no order ID" responses
+        if "no order" in user_lower or "don't have" in user_lower or "n/a" in user_lower:
+            if "order" in user_lower:
+                state.slots["order_id"] = "N/A"
         
-        try:
-            # Get conversation context first
-            conversation_context = self.conversation_history.get(conversation_id, [])
-            
-            # Initialize conversation state if needed
-            if conversation_id not in self.conversation_state:
-                self.conversation_state[conversation_id] = {
-                    'order_id': None,
-                    'product': None,
-                    'return_reason': None,
-                    'ticket_created': False
-                }
-            
-            # Extract entities with conversation context and state
-            entities = self.extract_entities(query, conversation_context, conversation_id)
-            
-            # Update conversation state with new entities
-            state = self.conversation_state[conversation_id]
-            for key in ['order_id', 'product', 'return_reason']:
-                if key in entities:
-                    state[key] = entities[key]
-                    logger.info(f"Updated state {key}: {entities[key]}")
-            
-            # Classify intent with enhanced entity awareness
-            intent, confidence = self.classify_intent(query, entities)
-            
-            # Search knowledge base with conversation context
-            relevant_chunks = self.search_knowledge_base(query, conversation_context=conversation_context)
-            logger.info(f"Query: '{query}' - Found {len(relevant_chunks)} relevant chunks")
-            
-            # Log the chunks for debugging
-            if relevant_chunks:
-                for i, chunk in enumerate(relevant_chunks[:2]):  # Log first 2 chunks
-                    logger.info(f"Chunk {i+1}: {chunk['content'][:100]}...")
+        # Handle product names - more flexible and accepting
+        if not state.slots["product_name"]:
+            # First, try to extract from entities if available
+            if "product" in entities and entities["product"]:
+                state.slots["product_name"] = entities["product"]
             else:
-                logger.info("No relevant chunks found in knowledge base")
+                # Look for product keywords as hints, but be more flexible
+                product_keywords = [
+                    # Clothing & Fashion
+                    "shirt", "t-shirt", "tshirt", "pants", "jeans", "dress", "skirt", "jacket", "coat", "sweater", "hoodie", "sweatshirt",
+                    "shoes", "boots", "sandals", "sneakers", "trainers", "heels", "flats", "loafers", "oxfords",
+                    "bag", "purse", "handbag", "backpack", "wallet", "belt", "scarf", "hat", "cap", "sunglasses",
+                    
+                    # Electronics
+                    "phone", "smartphone", "mobile", "laptop", "computer", "pc", "tablet", "ipad", "watch", "smartwatch",
+                    "headphones", "earbuds", "earphones", "speaker", "camera", "tv", "television", "monitor", "keyboard", "mouse",
+                    "charger", "cable", "adapter", "powerbank", "battery", "case", "cover", "screen protector",
+                    
+                    # Personal Care & Beauty
+                    "shampoo", "conditioner", "soap", "body wash", "lotion", "cream", "moisturizer", "sunscreen", "sunscreen lotion",
+                    "makeup", "cosmetics", "lipstick", "mascara", "foundation", "concealer", "eyeshadow", "blush", "powder",
+                    "perfume", "cologne", "deodorant", "toothpaste", "toothbrush", "razor", "shaving cream", "hair brush", "comb",
+                    
+                    # Home & Kitchen
+                    "book", "magazine", "newspaper", "furniture", "chair", "table", "bed", "sofa", "couch", "lamp", "mirror",
+                    "kitchen", "utensils", "pots", "pans", "dishes", "plates", "bowls", "cups", "glasses", "mugs",
+                    "appliances", "refrigerator", "fridge", "microwave", "oven", "stove", "dishwasher", "washing machine", "dryer",
+                    
+                    # Sports & Outdoor
+                    "bicycle", "bike", "tent", "sleeping bag", "backpack", "hiking", "fishing", "golf", "tennis", "basketball",
+                    "football", "soccer", "baseball", "volleyball", "swimming", "yoga", "fitness", "exercise", "gym equipment",
+                    
+                    # Toys & Games
+                    "toy", "game", "puzzle", "board game", "video game", "console", "controller", "doll", "action figure", "stuffed animal",
+                    
+                    # Food & Beverages
+                    "food", "snack", "beverage", "drink", "coffee", "tea", "juice", "water", "soda", "pop", "chocolate", "candy",
+                    
+                    # Health & Wellness
+                    "vitamins", "supplements", "medicine", "medication", "bandage", "bandaid", "thermometer", "pillow", "blanket", "towel"
+                ]
+                
+                # Check if any product keyword is mentioned
+                for product in product_keywords:
+                    if product in user_lower:
+                        state.slots["product_name"] = product
+                        break
+                
+                # If no keyword match, try to extract any reasonable product name from user input
+                if not state.slots["product_name"]:
+                    # Look for common product indicators
+                    product_indicators = ["product", "item", "thing", "order", "purchase", "bought", "received"]
+                    for indicator in product_indicators:
+                        if indicator in user_lower:
+                            # Extract the word after the indicator or before it
+                            words = user_text.split()
+                            for i, word in enumerate(words):
+                                if indicator.lower() in word.lower():
+                                    # Try to get the next word as product name
+                                    if i + 1 < len(words) and len(words[i + 1]) > 2:
+                                        potential_product = words[i + 1].strip(".,!?")
+                                        if not potential_product.isdigit():  # Avoid numbers
+                                            state.slots["product_name"] = potential_product
+                                            break
+                                    # Or try the previous word
+                                    elif i > 0 and len(words[i - 1]) > 2:
+                                        potential_product = words[i - 1].strip(".,!?")
+                                        if not potential_product.isdigit():  # Avoid numbers
+                                            state.slots["product_name"] = potential_product
+                                            break
+                            break
+                    
+                    # Additional safety check: don't fill product slot with question phrases
+                    if not state.slots["product_name"]:
+                        question_phrases = ["how may i help you", "how can i help you", "what can i do", "what should i do", "what", "how", "why", "when", "where", "who"]
+                        if any(phrase in user_lower for phrase in question_phrases):
+                            # Don't fill product slot with questions
+                            pass
+                    
+                    # Only accept user input as product name if it's clearly a product
+                    # Don't auto-fill with random user input to avoid confusion
+                    pass
+        
+        # Handle dates - more comprehensive and flexible
+        if not state.slots["purchase_date"]:
+            # Look for various date patterns
+            date_patterns = [
+                r"\b(?:\d{4}-\d{2}-\d{2})\b",                    # 2023-01-26, 26-06-2003
+                r"\b(?:\d{2}/\d{2}/\d{4})\b",                    # 26/01/2023, 01/26/2023
+                r"\b(?:\d{1,2}\s+\w+\s+\d{4})\b",               # 26 january 2023, 26 jan 2023
+                r"\b(?:\d{1,2}\s+\w+)\b",                        # 26 january, 26 jan (current year assumed)
+                r"\b(?:\w+\s+\d{1,2}\s*,?\s*\d{4})\b",          # january 26, 2023, jan 26 2023
+                r"\b(?:\d{1,2}-\d{2}-\d{4})\b",                 # 26-01-2023, 26-06-2003
+                r"\b(?:\d{1,2}\.\d{2}\.\d{4})\b",               # 26.01.2023, 26.06.2003
+            ]
             
-            # Generate response with conversation context
-            response = self.generate_response(query, relevant_chunks, intent, entities, conversation_context, conversation_id)
+            for pattern in date_patterns:
+                date_match = re.search(pattern, user_text, re.I)
+                if date_match:
+                    state.slots["purchase_date"] = date_match.group(0)
+                    break
             
-            # Determine if ticket creation is needed (check state first)
-            ticket_id = None
-            if not state['ticket_created'] and self.should_create_ticket(intent, entities, confidence, query, relevant_chunks, conversation_id):
-                ticket_id = self.create_support_ticket(query, intent, entities)
-                state['ticket_created'] = True
-                logger.info(f"Created ticket {ticket_id} for conversation {conversation_id}")
+            # If no pattern match, check for relative dates
+            if not state.slots["purchase_date"]:
+                relative_dates = [
+                    "yesterday", "today", "tomorrow", "last week", "last month", 
+                    "this week", "this month", "few days ago", "couple of days ago",
+                    "recently", "earlier this week", "earlier this month"
+                ]
+                for relative_date in relative_dates:
+                    if relative_date in user_lower:
+                        state.slots["purchase_date"] = relative_date
+                        break
             
-            # Calculate response time
-            response_time = time.time() - start_time
-            
-            # Update analytics
-            self.analytics['total_queries'] += 1
-            self.analytics['intent_distribution'][intent] += 1
-            self.analytics['response_times'].append(response_time)
-            self.analytics['avg_response_time'] = np.mean(self.analytics['response_times'])
-            
-            # Calculate entity extraction rate
-            total_queries = self.analytics['total_queries']
-            queries_with_entities = sum(1 for _ in range(total_queries) if entities)
-            self.analytics['entity_extraction_rate'] = queries_with_entities / total_queries if total_queries > 0 else 0
-            
-            # Store conversation
-            if conversation_id not in self.conversation_history:
-                self.conversation_history[conversation_id] = []
-            
-            # Debug: Log what we're storing
-            logger.info(f"Storing conversation entry - entities: {entities}")
-            
-            self.conversation_history[conversation_id].append({
-                'query': query,
-                'response': response,
-                'intent': intent,
-                'confidence': confidence,
-                'entities': entities,
-                'ticket_id': ticket_id,
-                'timestamp': datetime.now().isoformat()
-            })
-            
-            # Debug: Log the full conversation history
-            logger.info(f"Full conversation history for {conversation_id}: {self.conversation_history[conversation_id]}")
-            
-            return {
-                'response': response,
-                'metadata': {
-                    'intent': intent,
-                    'confidence': confidence,
-                    'entities': entities,
-                    'ticket_id': ticket_id,
-                    'relevant_chunks': len(relevant_chunks),
-                    'needs_clarification': confidence < 0.4,
-                    'response_time': response_time
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing query: {e}")
-            return {
-                'response': "I apologize, but I encountered an error processing your request. Please try again.",
-                'metadata': {
-                    'error': str(e),
-                    'intent': 'error',
-                    'confidence': 0.0,
-                    'entities': {},
-                    'relevant_chunks': 0,
-                    'ticket_id': None,
-                    'needs_clarification': True,
-                    'response_time': time.time() - start_time
-                }
-            }
+            # Also try to extract from entities if available
+            if not state.slots["purchase_date"] and "date" in entities and entities["date"]:
+                state.slots["purchase_date"] = entities["date"]
 
-# Initialize the RAG chatbot globally (reused across requests)
-rag_bot = None
+    def _get_next_clarification(self, state: ChatState, intents: List[Tuple[str, float]]) -> str:
+        """Get the next clarifying question based on missing slots."""
+        if not intents:
+            return "Could you tell me whether this is about billing, a technical issue, your account, or a complaint?"
+        
+        # Set issue type if we have intents
+        if intents and not state.slots["issue_type"]:
+            state.slots["issue_type"] = intents[0][0]
+        
+        # Determine required slots by intent
+        intent = state.slots["issue_type"] or (intents[0][0] if intents else "general")
+        if intent == "billing":
+            required = ["order_id", "product_name", "purchase_date", "issue_description"]
+        elif intent == "technical":
+            required = ["issue_description"]
+        elif intent == "account":
+            required = ["email", "issue_description"]
+        elif intent == "complaints":
+            required = ["order_id", "issue_description"]
+        else:
+            required = ["issue_description"]
 
-def get_rag_bot():
-    """Get or create RAG chatbot instance (singleton pattern)"""
-    global rag_bot
-    if rag_bot is None:
-        try:
-            rag_bot = RAGChatbot()
-            logger.info("RAG chatbot initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize RAG chatbot: {e}")
-            # Create a minimal fallback instance
-            rag_bot = RAGChatbot()
-            rag_bot.knowledge_base = []
-            rag_bot.vector_index = None
-    return rag_bot
+        # Ask missing slots with intent-aware prompts
+        for slot in required:
+            if not state.slots.get(slot):
+                if slot == "order_id":
+                    return "What is your order ID? (Examples: 12345, AB12345, or just say 'no order ID' if you don't have one)"
+                if slot == "product_name":
+                    if state.slots["order_id"] and state.slots["order_id"] != "N/A":
+                        return f"Got it, order ID {state.slots['order_id']}. What product are you having issues with? (Examples: shampoo, phone, laptop, or just describe the item)"
+                    return "What product are you having issues with? (Examples: shampoo, phone, laptop, or just describe the item)"
+                if slot == "purchase_date":
+                    if state.slots["product_name"]:
+                        prefix = f"For {state.slots['product_name']}"
+                        if state.slots["order_id"] and state.slots["order_id"] != "N/A":
+                            prefix = f"For order {state.slots['order_id']} and {state.slots['product_name']}"
+                        return f"Thanks! {prefix}, when did you purchase this? (Examples: today, yesterday, 26 January, 26-01-2023, or any date format)"
+                    return "When did you purchase this? (Examples: today, yesterday, 26 January, 26-01-2023, or any date format)"
+                if slot == "email":
+                    return "What is the email on your account? (e.g., name@example.com)"
+                if slot == "issue_description":
+                    # Intent-specific hints
+                    hints = {
+                        "billing": "e.g., refund due to wrong item, duplicate charge, payment failed",
+                        "technical": "e.g., app crashes on checkout, cannot add to cart",
+                        "account": "e.g., forgot password, cannot access account, change email",
+                        "complaints": "e.g., package damaged, delivery late, wrong size",
+                        "general": "e.g., need help with product details or availability",
+                    }
+                    hint = hints.get(intent, "")
+                    return f"Could you describe the issue briefly? {hint}"
 
-# Web Routes
-@app.route('/')
-def index():
-    """Serve the chatbot UI"""
-    return render_template('index.html')
+        # All required slots filled, create ticket
+        if not state.ticket_created:
+            state.ticket_created = True
+            state.conversation_stage = "resolved"
+            ticket_id = f"TKT-{int(time.time())}"
+            
+            if state.slots["order_id"] and state.slots["order_id"] != "N/A":
+                prod = f" ({state.slots['product_name']})" if state.slots.get("product_name") else ""
+                return f"Perfect! 🎫 I've created a support ticket (ID: {ticket_id}) for your {state.slots['issue_type']} issue with order {state.slots['order_id']}{prod}. Our team will get back to you within 2 hours."
+            else:
+                target = state.slots.get("product_name") or "your request"
+                return f"Perfect! 🎫 I've created a support ticket (ID: {ticket_id}) for your {state.slots['issue_type']} issue regarding {target}. Our team will get back to you within 2 hours."
+        
+        return "I've already created a ticket for you. Our team will follow up shortly."
 
-# API Routes
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    try:
-        bot = get_rag_bot()
-        system_status = {
-            'status': 'healthy',
-            'system_initialized': bot.vector_index is not None,
-            'knowledge_base_size': len(bot.knowledge_base),
-            'apis_configured': {
-                'cohere': bool(bot.cohere_api_key),
-                'groq': bool(bot.groq_api_key)
-            }
+    def _debug_slots(self, state: ChatState) -> str:
+        """Debug method to show current slot state."""
+        filled = [f"{k}: {v}" for k, v in state.slots.items() if v]
+        empty = [k for k, v in state.slots.items() if not v]
+        return f"Filled: {filled}, Empty: {empty}, Ticket: {state.ticket_created}"
+
+    def _reset_conversation(self, state: ChatState) -> None:
+        """Reset conversation state for a new conversation."""
+        state.slots = {
+            "order_id": None,
+            "purchase_date": None,
+            "product_name": None,
+            "issue_type": None,
+            "issue_description": None,
+            "additional_info": None,
+            "email": None,
+            "amount": None
         }
-        return jsonify(system_status)
-    except Exception as e:
-        return jsonify({'status': 'error', 'error': str(e)}), 500
+        state.ticket_created = False
+        state.conversation_stage = "greeting"
+        # Keep only the last few turns for context
+        if len(state.history) > 4:
+            state.history = state.history[-4:]
 
-@app.route('/api/chat', methods=['POST'])
-def chat():
-    """Main chat endpoint"""
-    try:
-        data = request.json
-        message = data.get('message', '')
-        conversation_id = data.get('conversation_id', str(uuid.uuid4()))
-        
-        if not message.strip():
-            return jsonify({'error': 'Message cannot be empty'}), 400
-        
-        # Get RAG bot instance
-        bot = get_rag_bot()
-        
-        # Process the query
-        result = bot.process_query(message, conversation_id)
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Chat endpoint error: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
+    # --- Main chat ---
+    def chat(self, user_text: str, session_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        t0 = time.time()
+        session_id = session_id or str(uuid.uuid4())
+        state = self._get_state(session_id)
+        self._append_history(state, "user", user_text)
 
-@app.route('/api/analytics', methods=['GET'])
-def analytics():
-    """Analytics endpoint"""
-    try:
-        bot = get_rag_bot()
-        return jsonify(dict(bot.analytics))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        # Handle smalltalk and basic responses first
+        smalltalk_response = self._handle_smalltalk(user_text)
+        if smalltalk_response:
+            self._append_history(state, "assistant", smalltalk_response)
+            return {
+                "session_id": session_id,
+                "answer": smalltalk_response,
+                "confidence": 1.0,
+                "intents": [("general", 1.0)],
+                "entities": {},
+                "clarification": False,
+                "sources": [],
+                "latency_ms": int((time.time() - t0) * 1000),
+            }
+        
+        # Check if user wants to start over
+        if any(phrase in user_text.lower() for phrase in ["new issue", "start over", "reset", "another problem", "different issue"]):
+            self._reset_conversation(state)
+            self._append_history(state, "assistant", "Alright, let's start fresh! What can I help you with today?")
+            return {
+                "session_id": session_id,
+                "answer": "Alright, let's start fresh! What can I help you with today?",
+                "confidence": 1.0,
+                "intents": [("general", 1.0)],
+                "entities": {},
+                "clarification": False,
+                "sources": [],
+                "latency_ms": int((time.time() - t0) * 1000),
+            }
 
-@app.route('/api/knowledge-base', methods=['GET'])
-def knowledge_base_info():
-    """Get knowledge base information"""
-    try:
-        bot = get_rag_bot()
-        return jsonify({
-            'total_chunks': len(bot.knowledge_base),
-            'sources': list(set(chunk['source'] for chunk in bot.knowledge_base)),
-            'embedding_dimension': bot.embeddings.shape[1] if bot.embeddings is not None else 0,
-            'vector_index_size': len(bot.vector_index) if bot.vector_index is not None else 0
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        # Part 1: intents + entities
+        # Prefer embeddings-based classifier, fallback handled internally
+        intents = self.intent_classifier.classify(user_text)
+        entities = self.extractor.extract(user_text) if self.extractor else naive_entity_extract(user_text)
+        
+        # Fill conversation slots with extracted information
+        self._fill_slots(state, entities, user_text)
+        
+        # Debug: Log what slots were filled (optional)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Slots after filling: %s", self._debug_slots(state))
+        
+        # Force debug output to see what's happening
+        print(f"DEBUG: Slots after filling: {self._debug_slots(state)}")
+        
+        # Check if we need to ask for clarification or if we have enough info
+        if not state.ticket_created:
+            # Use intent-specific required slots
+            intent = (state.slots.get("issue_type") or (intents[0][0] if intents else "general"))
+            if intent == "billing":
+                required = ["order_id", "product_name", "purchase_date", "issue_description"]
+            elif intent == "technical":
+                required = ["issue_description"]
+            elif intent == "account":
+                required = ["email", "issue_description"]
+            elif intent == "complaints":
+                required = ["order_id", "issue_description"]
+            else:
+                required = ["issue_description"]
 
-@app.route('/api/test-search', methods=['POST'])
-def test_search():
-    """Test search functionality"""
-    try:
-        data = request.json
-        query = data.get('query', '')
+            missing = [s for s in required if not state.slots.get(s)]
+            if missing:
+                # Enter collecting info stage
+                state.conversation_stage = "collecting_info"
+                answer_text = self._get_next_clarification(state, intents)
+                confidence = 0.4
+                ask_clarify = True
+            else:
+                # All required slots filled → create ticket
+                answer_text = self._get_next_clarification(state, intents)
+                confidence = 0.9
+                ask_clarify = False
+        else:
+            # Ticket already created, provide helpful response
+            answer_text = "I've already created a support ticket for you. Our team will get back to you within 2 hours. Is there anything else I can help you with?"
+            confidence = 0.9
+            ask_clarify = False
         
-        if not query:
-            return jsonify({'error': 'Query cannot be empty'}), 400
-        
-        bot = get_rag_bot()
-        results = bot.search_knowledge_base(query, top_k=5)
-        
-        return jsonify({
-            'query': query,
-            'results': results,
-            'total_results': len(results)
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/clear-chat', methods=['POST'])
-def clear_chat():
-    """Clear chat history and conversation state"""
-    try:
-        data = request.json
-        conversation_id = data.get('conversation_id', '')
-        
-        if conversation_id:
-            bot = get_rag_bot()
-            # Clear conversation history
-            if conversation_id in bot.conversation_history:
-                del bot.conversation_history[conversation_id]
-                logger.info(f"Cleared conversation history for {conversation_id}")
+        # Only do RAG retrieval if we're not in clarification mode
+        if not ask_clarify and not state.ticket_created:
+            # Part 2: retrieval for detailed answers
+            retrieved = self.hybrid.retrieve(user_text, top_k=TOP_K)
+            # Optional rerank
+            if self.reranker.enabled:
+                retrieved = self.reranker.rerank(user_text, retrieved, top_k=TOP_K)
             
-            # Clear conversation state
-            if conversation_id in bot.conversation_state:
-                del bot.conversation_state[conversation_id]
-                logger.info(f"Cleared conversation state for {conversation_id}")
-        
-        return jsonify({'status': 'success', 'message': 'Chat cleared successfully'})
-        
-    except Exception as e:
-        logger.error(f"Clear chat error: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
+            # Build context chunks (cap to token budget)
+            context_chunks: List[DocChunk] = []
+            used = set()
+            budget = MAX_CONTEXT_TOKENS
+            for r in retrieved:
+                if r.chunk.chunk_id in used:
+                    continue
+                tk = estimate_tokens(r.chunk.text)
+                if tk > budget:
+                    continue
+                context_chunks.append(r.chunk)
+                used.add(r.chunk.chunk_id)
+                budget -= tk
+                if budget <= 0:
+                    break
+            
+            # Generate detailed response using RAG
+            if context_chunks:
+                prompt = build_prompt(user_text, context_chunks, state, entities)
+                raw = self.llm.generate(prompt, max_tokens=512)
+                if raw.strip():
+                    answer_text = raw.strip()
+                    confidence = min(0.95, max(ANSWER_MIN_CONFIDENCE, (retrieved[0].score if retrieved else 0.2)))
+        else:
+            # In clarification mode, no retrieval needed
+            retrieved = []
+            context_chunks = []
 
-if __name__ == '__main__':
-    print("🚀 Starting RAG Customer Support Chatbot...")
-    print("📊 Features enabled:")
-    print("  - Cohere embeddings for vector search")
-    print("  - NumPy for similarity matching")
-    print("  - Groq LLM for response generation")
-    print("  - Intelligent entity extraction")
-    print("  - Intent classification")
-    print("  - Smart support ticket creation")
-    print("  - Real-time analytics")
-    print("  - Cost-optimized API usage")
-    print("\n🌐 Server starting on http://localhost:5000")
-    print("🎨 Beautiful web interface available")
-    print(f"\n📂 Place your PDF knowledge base files in the '{Config.UPLOAD_FOLDER}/' folder")
+        self._append_history(state, "assistant", answer_text)
+
+        t1 = time.time()
+        duration_ms = int((t1 - t0) * 1000)
+
+        # Analytics
+        ANALYTICS.record(
+            {
+                "timestamp": utcnow_str(),
+                "session_id": session_id,
+                "user": user_text,
+                "assistant": answer_text,
+                "intents": intents,
+                "entities": entities,
+                "retrieval": [dataclasses.asdict(r) for r in retrieved],
+                "timings": {"total_ms": duration_ms},
+                "metadata": metadata or {},
+            }
+        )
+
+        return {
+            "session_id": session_id,
+            "answer": answer_text,
+            "confidence": round(confidence, 3),
+            "intents": intents,
+            "entities": entities,
+            "clarification": ask_clarify,
+            "sources": [
+                {"filename": Path(r.chunk.source).name, "chunk_id": r.chunk.chunk_id, "score": round(r.score, 3)}
+                for r in retrieved[:TOP_K]
+            ],
+            "latency_ms": duration_ms,
+        }
+
+    def feedback(self, session_id: str, satisfaction: str, comment: Optional[str] = None) -> Dict[str, Any]:
+        payload = {
+            "timestamp": utcnow_str(),
+            "session_id": session_id,
+            "feedback": {"satisfaction": satisfaction, "comment": comment},
+        }
+        ANALYTICS.record(payload)
+        return {"ok": True}
+
+    # Rebuild index CLI
+    def rebuild_index(self, data_dir: Optional[str] = None):
+        data_dir = data_dir or self.data_dir
+        corpus = build_corpus(data_dir)
+        if not corpus:
+            logger.warning("No documents found to index in %s", data_dir)
+        self.faiss = FAISSIndex()
+        self.faiss.build(corpus, self.embedder)
+        self.bm25 = BM25(corpus)
+        self.hybrid = HybridRetriever(self.faiss, self.bm25, self.embedder, HYBRID_WEIGHTS)
+        logger.info("Index rebuilt.")
+
+
+# ------------------------------
+# FastAPI server
+# ------------------------------
+
+try:
+    from fastapi import FastAPI, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.templating import Jinja2Templates
+    from fastapi.responses import HTMLResponse
+    from fastapi.requests import Request
+    from pydantic import BaseModel
+    from uvicorn import run as uvicorn_run
+except Exception:
+    FastAPI = None  # type: ignore
+
+
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None
+    query: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class FeedbackRequest(BaseModel):
+    session_id: str
+    satisfaction: str  # "up" | "down"
+    comment: Optional[str] = None
+
+
+def create_app(orchestrator: ChatOrchestrator) -> Any:
+    if FastAPI is None:
+        raise RuntimeError("FastAPI not installed. Install fastapi and uvicorn.")
+
+    app = FastAPI(title="RAG Support Bot", version="1.0")
     
-    # Show client status
-    if rag_bot.cohere_client:
-        print("✅ Cohere client: Ready")
-    else:
-        print("❌ Cohere client: Not configured (check COHERE_API_KEY)")
+    # Mount static files
+    app.mount("/static", StaticFiles(directory="static"), name="static")
     
-    if rag_bot.groq_client:
-        print("✅ Groq client: Ready")
-    else:
-        print("❌ Groq client: Not configured (check GROQ_API_KEY)")
+    # Setup templates
+    templates = Jinja2Templates(directory="templates")
     
-    print("\n💡 Chatbot will only use Groq API when relevant content is found!")
-    
-    app.run(debug=Config.DEBUG, host=Config.HOST, port=Config.PORT)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/", response_class=HTMLResponse)
+    def root(request: Request):
+        return templates.TemplateResponse("index.html", {"request": request})
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "time": utcnow_str()}
+
+    @app.get("/metrics")
+    def metrics():
+        return ANALYTICS.snapshot()
+
+    @app.get("/api/analytics")
+    async def api_analytics():
+        try:
+            interactions = ANALYTICS.interactions
+            total = len(interactions)
+            # Average response time in seconds
+            times = [it.get("timings", {}).get("total_ms", 0) for it in interactions if it.get("timings")]
+            avg_response_time = (sum(times) / len(times) / 1000.0) if times else 0.0
+            # Total tickets (heuristic: assistant text mentions created ticket)
+            def _is_ticket(it: dict) -> bool:
+                a = (it.get("assistant") or "").lower()
+                return ("support ticket created" in a) or ("i've created a support ticket" in a)
+            total_tickets = sum(1 for it in interactions if _is_ticket(it))
+            # Entity extraction rate
+            entity_hits = sum(1 for it in interactions if it.get("entities") and len(it.get("entities")) > 0)
+            entity_extraction_rate = (entity_hits / total) if total else 0.0
+            # Intent distribution (top intent only)
+            from collections import Counter
+            c = Counter()
+            for it in interactions:
+                intents = it.get("intents") or []
+                if intents and isinstance(intents, list) and intents[0] and isinstance(intents[0], (list, tuple)):
+                    c[intents[0][0]] += 1
+            return {
+                "total_queries": total,
+                "total_tickets": total_tickets,
+                "avg_response_time": avg_response_time,
+                "entity_extraction_rate": entity_extraction_rate,
+                "intent_distribution": dict(c),
+            }
+        except Exception as e:
+            logger.exception("/api/analytics failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/clear-chat")
+    async def api_clear_chat(request: Request):
+        try:
+            body = await request.json()
+            sid = body.get("conversation_id")
+            if sid:
+                # Remove the session entirely; next message starts fresh
+                orchestrator.sessions.pop(sid, None)
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("/api/clear-chat failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/chat")
+    def chat(req: ChatRequest):
+        try:
+            return orchestrator.chat(req.query, session_id=req.session_id, metadata=req.metadata)
+        except Exception as e:
+            logger.exception("/chat failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/chat")
+    async def api_chat(request: Request):
+        try:
+            body = await request.json()
+            message = body.get("message", "")
+            conversation_id = body.get("conversation_id", "")
+            
+            # Call the orchestrator
+            result = orchestrator.chat(message, session_id=conversation_id)
+            
+            # Format response to match frontend expectations
+            return {
+                "response": result["answer"],
+                "metadata": {
+                    "intent": result["intents"][0][0] if result["intents"] else "general",
+                    "confidence": result["confidence"],
+                    "entities": result["entities"],
+                    "response_time": result["latency_ms"] / 1000.0,
+                    "ticket_id": conversation_id,
+                    "relevant_chunks": len(result["sources"])
+                }
+            }
+        except Exception as e:
+            logger.exception("/api/chat failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/feedback")
+    def feedback(req: FeedbackRequest):
+        try:
+            return orchestrator.feedback(req.session_id, req.satisfaction, req.comment)
+        except Exception as e:
+            logger.exception("/feedback failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    return app
+
+
+# Expose ASGI app for Gunicorn/Render
+orch = ChatOrchestrator(data_dir=DEFAULT_DATA_DIR)
+app = create_app(orch)
+
+# ------------------------------
+# CLI Entrypoint
+# ------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="RAG Customer Support Chatbot")
+    parser.add_argument("--serve", action="store_true", help="Run FastAPI server")
+    parser.add_argument("--rebuild-index", action="store_true", help="Rebuild FAISS/BM25 index")
+    parser.add_argument("--data", type=str, default=DEFAULT_DATA_DIR, help="Data directory for documents")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
+    orch = ChatOrchestrator(data_dir=args.data)
+
+    if args.rebuild_index:
+        orch.rebuild_index(args.data)
+
+    if args.serve:
+        if FastAPI is None:
+            print("Install fastapi & uvicorn: pip install fastapi uvicorn pydantic")
+            sys.exit(1)
+        app = create_app(orch)
+        uvicorn_run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
