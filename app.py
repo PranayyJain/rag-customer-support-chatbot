@@ -1772,7 +1772,18 @@ def create_app(orchestrator: ChatOrchestrator) -> Any:
             }
         except Exception as e:
             logger.exception("/api/chat failed: %s", e)
-            raise HTTPException(status_code=500, detail=str(e))
+            # Return a graceful fallback instead of 500 so the UI doesn't break
+            return {
+                "response": "Sorry, I hit an internal error while processing that. Please rephrase or try again.",
+                "metadata": {
+                    "intent": "general",
+                    "confidence": 0.0,
+                    "entities": {},
+                    "response_time": 0.0,
+                    "ticket_id": conversation_id,
+                    "relevant_chunks": 0
+                }
+            }
 
     @app.post("/feedback")
     def feedback(req: FeedbackRequest):
