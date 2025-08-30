@@ -1,25 +1,31 @@
 import time
+import os
+import pickle
 import numpy as np
 import cohere
 import faiss
 import json
 import logging
 from typing import List, Tuple, Dict, Optional
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 logger = logging.getLogger(__name__)
 
 class RAGPipeline:
     def __init__(self, cohere_client, faq_file="faq.json", index_file="faiss_index.bin", 
-                 chunks_file="chunks.npy", faq_meta_file="faq_meta.json"):
+                 chunks_file="chunks.npy", faq_meta_file="faq_meta.json", tfidf_file: str = "tfidf_vectorizer.pkl"):
         self.cohere_client = cohere_client
         self.faq_file = faq_file
         self.index_file = index_file
         self.chunks_file = chunks_file
         self.faq_meta_file = faq_meta_file
+        self.tfidf_file = tfidf_file
         
         self.index = None
         self.chunks = []
         self.faq_data = []
+        self.use_tfidf = False
+        self.tfidf_vectorizer: Optional[TfidfVectorizer] = None
         
         # Try to load existing index, otherwise build it
         try:
@@ -91,21 +97,39 @@ class RAGPipeline:
                 logger.error("No chunks created from FAQ data")
                 return
             
-            # Generate embeddings
+            # Generate embeddings (Cohere) with fallback to TF-IDF on failure
+            embeddings = None
             if self.cohere_client:
                 embeddings_list = self._embed_with_backoff(self.chunks, input_type="search_document")
-                if not embeddings_list:
-                    logger.error("Error generating embeddings for index build")
-                    return
-                embeddings = np.array(embeddings_list).astype("float32")
-            else:
-                logger.error("Cohere client not available")
-                return
+                if embeddings_list:
+                    embeddings = np.array(embeddings_list).astype("float32")
             
-            # Build FAISS index
-            dim = embeddings.shape[1]
-            self.index = faiss.IndexFlatL2(dim)
-            self.index.add(embeddings)
+            if embeddings is not None:
+                # Build FAISS index (L2)
+                dim = embeddings.shape[1]
+                self.index = faiss.IndexFlatL2(dim)
+                self.index.add(embeddings)
+                self.use_tfidf = False
+                self.tfidf_vectorizer = None
+            else:
+                # Fallback: TF-IDF vectors + cosine similarity (IndexFlatIP with L2 normalization)
+                logger.warning("Falling back to TF-IDF embeddings for index build")
+                self.tfidf_vectorizer = TfidfVectorizer(max_features=2048)
+                tfidf_matrix = self.tfidf_vectorizer.fit_transform(self.chunks)
+                tfidf_vectors = tfidf_matrix.toarray().astype("float32")
+                # L2 normalize rows
+                norms = np.linalg.norm(tfidf_vectors, axis=1, keepdims=True) + 1e-8
+                tfidf_vectors = tfidf_vectors / norms
+                dim = tfidf_vectors.shape[1]
+                self.index = faiss.IndexFlatIP(dim)
+                self.index.add(tfidf_vectors)
+                self.use_tfidf = True
+                # Persist vectorizer for reloads
+                try:
+                    with open(self.tfidf_file, "wb") as vf:
+                        pickle.dump(self.tfidf_vectorizer, vf)
+                except Exception as e:
+                    logger.warning(f"Failed to save TF-IDF vectorizer: {e}")
             
             # Save index and metadata
             faiss.write_index(self.index, self.index_file)
@@ -127,6 +151,15 @@ class RAGPipeline:
             
             with open(self.faq_meta_file, "r", encoding="utf-8") as f:
                 self.faq_data = json.load(f)
+            # Load TF-IDF vectorizer if present
+            if os.path.exists(self.tfidf_file):
+                try:
+                    with open(self.tfidf_file, "rb") as vf:
+                        self.tfidf_vectorizer = pickle.load(vf)
+                        self.use_tfidf = True
+                        logger.info("Loaded TF-IDF vectorizer for retrieval")
+                except Exception as e:
+                    logger.warning(f"Failed to load TF-IDF vectorizer: {e}")
             
             logger.info(f"Loaded FAISS index with {len(self.chunks)} chunks")
             
@@ -140,14 +173,18 @@ class RAGPipeline:
             return "", []
         
         try:
-            # Get query embedding
-            q_emb_list = self._embed_with_backoff([query], input_type="search_query")
-            if not q_emb_list:
-                raise RuntimeError("Failed to embed query after retries")
-            q_emb = q_emb_list[0]
-            
-            # Search index
-            D, I = self.index.search(np.array([q_emb]).astype("float32"), k)
+            # Get query embedding depending on mode
+            if self.use_tfidf and self.tfidf_vectorizer is not None:
+                q_vec = self.tfidf_vectorizer.transform([query]).toarray().astype("float32")
+                norms = np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-8
+                q_vec = q_vec / norms
+                D, I = self.index.search(q_vec, k)
+            else:
+                q_emb_list = self._embed_with_backoff([query], input_type="search_query")
+                if not q_emb_list:
+                    raise RuntimeError("Failed to embed query after retries")
+                q_emb = q_emb_list[0]
+                D, I = self.index.search(np.array([q_emb]).astype("float32"), k)
             
             # Get matched chunks and sources
             matched_chunks = []
