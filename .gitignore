@@ -1,0 +1,28 @@
+# Virtual envs
+venv/
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Data & artifacts
+conversations.db
+analytics.json
+/data/
+faiss_index.bin
+chunks.npy
+
+# Logs
+*.log
+
+# Misc
+*.sqlite3

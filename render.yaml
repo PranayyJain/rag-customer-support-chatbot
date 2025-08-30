@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: customer-support-chatbot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 2 -k gthread --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app"
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: COHERE_API_KEY
+        sync: false
+      - key: DB_PATH
+        value: /data/conversations.db
+      - key: ANALYTICS_PATH
+        value: /data/analytics.json
+      - key: FLASK_ENV
+        value: production
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
