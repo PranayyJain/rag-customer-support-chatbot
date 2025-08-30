@@ -29,6 +29,20 @@ CORS(app)
 DB_PATH = os.getenv('DB_PATH', 'conversations.db')
 ANALYTICS_PATH = os.getenv('ANALYTICS_PATH', 'analytics.json')
 
+# Ensure directories/files exist for DB and analytics paths
+try:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    analytics_dir = os.path.dirname(ANALYTICS_PATH)
+    if analytics_dir:
+        os.makedirs(analytics_dir, exist_ok=True)
+    if not os.path.exists(ANALYTICS_PATH):
+        with open(ANALYTICS_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f)
+except Exception as _e:
+    logger.warning(f"Could not prepare data paths: {DB_PATH}, {ANALYTICS_PATH}: {_e}")
+
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
